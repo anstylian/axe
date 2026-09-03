@@ -132,11 +132,44 @@ pub enum Commands {
     /// drive it. The network is fixed for the life of the server: pass
     /// `--network` or set `AXE_NETWORK`.
     Mcp {
+        #[command(subcommand)]
+        action: Option<McpCommands>,
         /// Allow the server to be pinned to mainnet. Without this, starting
         /// against mainnet is refused: the flows spend real funds, so that
         /// decision is made once by a human outside the conversation.
         #[arg(long)]
         allow_mainnet: bool,
+        /// The most transactions one load test started through the server
+        /// may send. Enforced by the server, so no tool argument can raise it.
+        #[arg(long, default_value_t = crate::mcp::policy::DEFAULT_MAX_TXS_PER_RUN)]
+        max_txs_per_run: u64,
+        /// The most transactions the server may send over its lifetime.
+        /// Unlimited when omitted.
+        #[arg(long)]
+        max_txs_total: Option<u64>,
+        /// A chain a load test may use as source or destination, by axelar
+        /// id. Repeat for several. Any chain when omitted.
+        #[arg(long = "allow-chain", value_name = "AXELAR_ID")]
+        allow_chains: Vec<String>,
+        /// Serve over HTTP on this address instead of stdio, for a client that
+        /// must not share this process's environment, such as an agent in a
+        /// sandbox. Requires `AXE_MCP_TOKEN`, which clients present as a
+        /// bearer token. Bind to an address only the intended client can
+        /// reach.
+        #[arg(long, value_name = "ADDR")]
+        listen: Option<std::net::SocketAddr>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum McpCommands {
+    /// Print the tools and documentation resources the server offers, without
+    /// starting it. Needs no network.
+    List {
+        /// Print the catalogue as JSON, with each tool's full input schema.
+        /// This is what a client receives from tools/list.
+        #[arg(long)]
+        json: bool,
     },
 }
 

@@ -1,0 +1,161 @@
+//! The arguments each tool accepts.
+//!
+//! These are the schemas an agent sees. None of them carries a network, a
+//! config path, an RPC override, or a key: the network was fixed when the
+//! server started (see [`crate::mcp::context::McpContext`]) and everything
+//! else comes from the operator environment the server was launched with.
+//! A test in the server module fails if a key-bearing field is ever added.
+
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+use crate::cli::{EvmContract, SolProgram};
+use crate::commands::load_test::{Protocol, TestType};
+use crate::commands::test_express;
+
+/// How many recent entries to report when the caller does not say.
+pub const DEFAULT_ACTIVITY_LIMIT: usize = 20;
+
+/// Arguments for the block lookup.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BlockArgs {
+    /// Block height. Omit for the current head. A height above the head is
+    /// predicted from the recent block rate.
+    pub number: Option<u64>,
+    /// Predict the block at this time, as RFC3339 or unix seconds. Cannot be
+    /// combined with a height.
+    pub at_time: Option<String>,
+}
+
+/// Arguments for the route check.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RouteArgs {
+    /// gmp for callContract, its for interchainTransfer, or its-with-data.
+    pub protocol: Protocol,
+    /// The chain-type pairing, for example sol-to-evm or evm-to-xrpl.
+    pub route: TestType,
+    /// Source chain axelar id, for example solana.
+    pub source_chain: String,
+    /// Destination chain axelar id, for example flow.
+    pub destination_chain: String,
+}
+
+/// Arguments for the Solana activity scan.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SolActivityArgs {
+    /// Restrict to one program: gateway, its, gas-service or memo. Omit for all.
+    pub program: Option<SolProgram>,
+    /// Recent transactions per program. Defaults to 20.
+    pub limit: Option<usize>,
+}
+
+impl SolActivityArgs {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT)
+    }
+}
+
+/// Arguments for the EVM activity scan.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EvmActivityArgs {
+    /// Chain axelar id, for example avalanche-fuji.
+    pub chain: String,
+    /// Restrict to one contract: gateway, its or gas-service. Omit for all.
+    pub contract: Option<EvmContract>,
+    /// Recent events per contract. Defaults to 20.
+    pub limit: Option<usize>,
+}
+
+impl EvmActivityArgs {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT)
+    }
+}
+
+/// Arguments for the calldata decoder.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CalldataArgs {
+    /// Hex calldata, with or without a leading 0x.
+    pub calldata: String,
+}
+
+/// Arguments for the transaction decoder.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TxArgs {
+    /// EVM transaction hash, starting with 0x.
+    pub tx_hash: String,
+    /// Restrict the search to one chain axelar id. Omit to search all
+    /// configured EVM chains.
+    pub chain: Option<String>,
+}
+
+/// Arguments for the express transfer scan.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExpressScanArgs {
+    /// Express-supported chain axelar ids to scan.
+    pub chains: Vec<String>,
+    /// Recent transfers per chain. Defaults to 5.
+    pub recent: Option<usize>,
+}
+
+impl ExpressScanArgs {
+    pub fn recent(&self) -> usize {
+        self.recent.unwrap_or(test_express::DEFAULT_RECENT)
+    }
+}
+
+/// Arguments for starting a load test.
+///
+/// Carries no keys, no RPC overrides and no config path: those come from the
+/// operator environment the server was launched with. Nothing an agent sends
+/// can substitute a different signer.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StartLoadTestArgs {
+    /// Source chain axelar id, for example solana.
+    pub source_chain: String,
+    /// Destination chain axelar id, for example flow.
+    pub destination_chain: String,
+    /// gmp for callContract, its for interchainTransfer, or its-with-data.
+    pub protocol: Option<Protocol>,
+    /// The chain-type pairing. Omit to let axe infer it from the config.
+    pub route: Option<TestType>,
+    /// How many transactions to send. Defaults to 1.
+    pub num_txs: Option<u64>,
+}
+
+impl StartLoadTestArgs {
+    pub fn num_txs(&self) -> u64 {
+        self.num_txs.unwrap_or(1)
+    }
+}
+
+/// Arguments for a tool that names one background run.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunArgs {
+    /// The run identifier returned by start_load_test.
+    pub run_id: String,
+}
+
+/// Arguments for a tool that names one chain.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChainArgs {
+    /// Chain axelar id, for example solana or avalanche-fuji.
+    pub chain: String,
+}
+
+/// Arguments for the verifier vote lookup.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VerifierVotesArgs {
+    /// Chain axelar id whose polls to inspect.
+    pub chain: String,
+    /// The verifier axelar1... address.
+    pub verifier: String,
+    /// Most recent votes to report. Defaults to 20.
+    pub limit: Option<usize>,
+}
+
+impl VerifierVotesArgs {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_ACTIVITY_LIMIT)
+    }
+}

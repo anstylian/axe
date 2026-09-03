@@ -420,13 +420,36 @@ async fn run_cli() -> Result<()> {
             json,
         } => commands::verifier_votes::run(network, chain, verifier, limit, json).await,
         cli::Commands::Propose(args) => commands::propose::run(args).await,
-        cli::Commands::Mcp { allow_mainnet } => {
+        cli::Commands::Mcp {
+            action: Some(cli::McpCommands::List { json }),
+            ..
+        } => mcp::list(json),
+        cli::Commands::Mcp {
+            action: None,
+            allow_mainnet,
+            max_txs_per_run,
+            max_txs_total,
+            allow_chains,
+            listen,
+        } => {
             // The pin is explicit on purpose: falling back to testnet would
             // let a long-lived server serve a network nobody chose.
             let network = cli.network.ok_or_else(|| {
                 eyre::eyre!("axe mcp needs a network: pass --network or set AXE_NETWORK")
             })?;
-            mcp::serve(network, allow_mainnet).await
+            let limits = mcp::policy::SpendLimits {
+                max_txs_per_run,
+                max_txs_total,
+                allowed_chains: allow_chains,
+            };
+            let endpoint = match listen {
+                Some(listen) => mcp::transport::Endpoint::Http {
+                    listen,
+                    token: mcp::transport::http_token_from_env()?,
+                },
+                None => mcp::transport::Endpoint::Stdio,
+            };
+            mcp::serve(network, allow_mainnet, limits, endpoint).await
         }
         cli::Commands::Test { subcommand } => run_test(subcommand, cli.network).await,
         cli::Commands::Bench { subcommand } => commands::bench::run(subcommand).await,

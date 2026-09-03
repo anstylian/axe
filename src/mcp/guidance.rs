@@ -71,8 +71,8 @@ fn uri_for(file: &str) -> String {
 /// Whether a route can be attempted, and why not when it cannot.
 #[derive(Debug, Serialize)]
 pub struct RouteSupport {
-    pub protocol: String,
-    pub route: String,
+    pub protocol: Protocol,
+    pub route: TestType,
     pub source_chain: String,
     pub destination_chain: String,
     pub supported: bool,
@@ -89,8 +89,8 @@ pub fn check_route(
 ) -> RouteSupport {
     let outcome = is_supported(protocol, route, source_chain, destination_chain);
     RouteSupport {
-        protocol: format!("{protocol:?}").to_lowercase(),
-        route: format!("{route:?}"),
+        protocol,
+        route,
         source_chain: source_chain.to_string(),
         destination_chain: destination_chain.to_string(),
         supported: outcome.is_ok(),
@@ -118,4 +118,61 @@ pub fn doc_body(uri: &str) -> Option<&'static str> {
         .iter()
         .find(|page| uri == uri_for(page.file))
         .map(|page| page.body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_route, doc_body, doc_resources, is_supported};
+    use crate::commands::load_test::{Protocol, TestType};
+
+    /// The verdict is whatever the load test's resolver says, for a pair it
+    /// accepts and a pair it rejects. The matrix itself is pinned by the
+    /// resolver's own tests, so this asserts the delegation, not the matrix.
+    #[test]
+    fn route_verdict_is_the_resolvers_verdict() {
+        for (protocol, route) in [
+            (Protocol::Gmp, TestType::SolToEvm),
+            (Protocol::Its, TestType::SolToSol),
+        ] {
+            let expected = is_supported(protocol, route, "solana", "flow");
+            let support = check_route(protocol, route, "solana", "flow");
+
+            assert_eq!(support.supported, expected.is_ok());
+            assert_eq!(
+                support.reason,
+                expected.err().map(|e| format!("{e:#}")),
+                "an unsupported pair carries the resolver's reason"
+            );
+            assert_eq!(support.source_chain, "solana");
+            assert_eq!(support.destination_chain, "flow");
+        }
+    }
+
+    #[test]
+    fn route_support_serializes_in_the_vocabulary_the_caller_used() {
+        let support = check_route(Protocol::ItsWithData, TestType::EvmToSol, "flow", "solana");
+        let json = serde_json::to_value(&support).unwrap();
+        assert_eq!(json["protocol"], "its-with-data");
+        assert_eq!(json["route"], "evm-to-sol");
+    }
+
+    #[test]
+    fn every_doc_resource_is_readable_and_nothing_else_is() {
+        let resources = doc_resources();
+        assert!(!resources.is_empty());
+        for resource in &resources {
+            assert!(
+                doc_body(&resource.uri).is_some(),
+                "{} unreadable",
+                resource.uri
+            );
+            assert!(
+                resource.description.is_some(),
+                "{} undescribed",
+                resource.uri
+            );
+        }
+        assert!(doc_body("axe://docs/../Cargo.toml").is_none());
+        assert!(doc_body("file:///etc/passwd").is_none());
+    }
 }

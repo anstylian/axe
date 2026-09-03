@@ -140,7 +140,15 @@ use route::{GmpRoute, ItsRoute, SupportedRoute};
 
 /// Load test type (extensible for future directions).
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, schemars::JsonSchema,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum TestType {
@@ -221,6 +229,7 @@ impl Display for TestType {
     Eq,
     clap::ValueEnum,
     serde::Deserialize,
+    serde::Serialize,
     schemars::JsonSchema,
 )]
 #[serde(rename_all = "kebab-case")]

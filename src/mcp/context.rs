@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use eyre::Result;
 
+use crate::mcp::policy::SpendPolicy;
 use crate::mcp::runs::RunRegistry;
 use crate::types::Network;
 
@@ -19,11 +20,17 @@ use crate::types::Network;
 pub struct McpContext {
     network: Network,
     runs: RunRegistry,
+    policy: SpendPolicy,
 }
 
 impl McpContext {
     /// Refuse mainnet unless the operator opted in when starting the server.
-    pub fn new(network: Network, allow_mainnet: bool, reports_dir: PathBuf) -> Result<Self> {
+    pub fn new(
+        network: Network,
+        allow_mainnet: bool,
+        reports_dir: PathBuf,
+        policy: SpendPolicy,
+    ) -> Result<Self> {
         if network == Network::Mainnet && !allow_mainnet {
             return Err(eyre::eyre!(
                 "refusing to serve mainnet without --allow-mainnet: these flows spend real funds"
@@ -33,6 +40,7 @@ impl McpContext {
         Ok(Self {
             network,
             runs: RunRegistry::new(reports_dir),
+            policy,
         })
     }
 
@@ -44,5 +52,56 @@ impl McpContext {
     /// Background load-test runs started through this server.
     pub fn runs(&self) -> &RunRegistry {
         &self.runs
+    }
+
+    /// The operator's caps on fund-spending tools. No tool can change them.
+    pub fn policy(&self) -> &SpendPolicy {
+        &self.policy
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::McpContext;
+    use crate::mcp::policy::SpendPolicy;
+    use crate::types::Network;
+
+    #[test]
+    fn mainnet_is_refused_without_the_opt_in() {
+        let err = McpContext::new(
+            Network::Mainnet,
+            false,
+            PathBuf::from("."),
+            SpendPolicy::default(),
+        )
+        .err()
+        .expect("mainnet without --allow-mainnet must be refused");
+        assert!(err.to_string().contains("--allow-mainnet"), "{err}");
+    }
+
+    #[test]
+    fn mainnet_is_served_with_the_opt_in() {
+        let context = McpContext::new(
+            Network::Mainnet,
+            true,
+            PathBuf::from("."),
+            SpendPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(context.network(), Network::Mainnet);
+    }
+
+    #[test]
+    fn other_networks_need_no_opt_in() {
+        let context = McpContext::new(
+            Network::Testnet,
+            false,
+            PathBuf::from("."),
+            SpendPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(context.network(), Network::Testnet);
     }
 }

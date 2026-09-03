@@ -32,7 +32,7 @@ use crate::types::Network;
 use crate::ui;
 
 /// Default number of recent express transfers to report per chain in scan mode.
-const DEFAULT_RECENT: usize = 5;
+pub(crate) const DEFAULT_RECENT: usize = 5;
 
 pub async fn run_config(
     network: Network,
@@ -291,37 +291,56 @@ pub(crate) struct ExpressPhases {
     pub command_id: Option<String>,
     pub status: Option<String>,
     pub symbol: Option<String>,
-    /// executed when the express executor fronted the funds, otherwise
-    /// not_observed.
-    pub phase1: &'static str,
+    pub phase1: Phase1Status,
     pub express_tx: Option<String>,
     pub executor: Option<String>,
-    /// reimbursed once the canonical execute landed, pending while it has not,
-    /// not_applicable when phase 1 never happened.
-    pub phase2: &'static str,
+    pub phase2: Phase2Status,
     pub execute_tx: Option<String>,
+}
+
+/// [`Phase1`] without its payload: the transaction and executor it carries
+/// are reported as their own fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Phase1Status {
+    /// The express executor fronted the funds.
+    Executed,
+    NotObserved,
+}
+
+/// [`Phase2`] without its payload: the execute transaction is reported as its
+/// own field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Phase2Status {
+    /// The canonical execute landed and paid the executor back.
+    Reimbursed,
+    /// Phase 1 happened, the canonical execute has not landed yet.
+    Pending,
+    /// Phase 1 never happened, so there is nothing to reimburse.
+    NotApplicable,
 }
 
 fn express_phases(record: &ExpressRecord) -> ExpressPhases {
     let (phase1, phase2) = record.phase_status();
 
-    let (phase1_label, express_tx, executor) = match &phase1 {
+    let (phase1_status, express_tx, executor) = match &phase1 {
         Phase1::Executed {
             executor_eoa,
             executor_contract,
             express_tx,
         } => (
-            "executed",
+            Phase1Status::Executed,
             express_tx.clone(),
             executor_eoa.clone().or_else(|| executor_contract.clone()),
         ),
-        Phase1::NotObserved => ("not_observed", None, None),
+        Phase1::NotObserved => (Phase1Status::NotObserved, None, None),
     };
 
-    let (phase2_label, execute_tx) = match &phase2 {
-        Phase2::Reimbursed { execute_tx } => ("reimbursed", execute_tx.clone()),
-        Phase2::Pending => ("pending", None),
-        Phase2::NotApplicable => ("not_applicable", None),
+    let (phase2_status, execute_tx) = match &phase2 {
+        Phase2::Reimbursed { execute_tx } => (Phase2Status::Reimbursed, execute_tx.clone()),
+        Phase2::Pending => (Phase2Status::Pending, None),
+        Phase2::NotApplicable => (Phase2Status::NotApplicable, None),
     };
 
     ExpressPhases {
@@ -331,10 +350,10 @@ fn express_phases(record: &ExpressRecord) -> ExpressPhases {
         command_id: record.command_id.clone(),
         status: record.status.clone(),
         symbol: record.symbol.clone(),
-        phase1: phase1_label,
+        phase1: phase1_status,
         express_tx,
         executor,
-        phase2: phase2_label,
+        phase2: phase2_status,
         execute_tx,
     }
 }
