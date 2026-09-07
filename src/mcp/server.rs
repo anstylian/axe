@@ -404,7 +404,8 @@ impl AxeMcp {
     /// rather than waiting, because a run can outlast a request timeout, and a
     /// cancelled request would lose the record of what was already spent. Poll
     /// load_test_report with the identifier to get the result. Only one run is
-    /// admitted at a time; while one is in flight this is refused and names
+    /// admitted at a time on this machine, across every axe server sharing
+    /// the data directory; while one is in flight this is refused and names
     /// it. The operator caps how many transactions a run may send, and may
     /// restrict the chains; a request outside those caps is refused and the
     /// caps cannot be raised from here. Check the route first, and check
@@ -452,17 +453,9 @@ impl AxeMcp {
         });
         let run_id = match started {
             Ok(run_id) => run_id,
-            Err(in_flight) => {
+            Err(refused) => {
                 policy.release(args.num_txs());
-                return Err(ErrorData::invalid_request(
-                    format!(
-                        "a load test is already running: {}. Runs spend from shared \
-                         accounts, so one is admitted at a time. Wait for it, or read \
-                         its report with load_test_report",
-                        in_flight.run_id
-                    ),
-                    None,
-                ));
+                return Err(ErrorData::invalid_request(refused.to_string(), None));
             }
         };
 

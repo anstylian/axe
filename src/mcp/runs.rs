@@ -16,11 +16,15 @@
 //! and the refusal names the run that is holding the slot.
 
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use serde::Serialize;
 use tokio::task::JoinHandle;
 
@@ -67,11 +71,49 @@ pub struct RunStarted {
     pub transactions: u64,
 }
 
-/// A start was refused because another run holds the spend slot.
+/// Why a start was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunInFlight {
-    pub run_id: String,
+pub enum StartRefused {
+    /// This process is already running one.
+    RunInFlight { run_id: String },
+    /// Another axe process on this machine holds the run lock.
+    HeldByAnotherProcess { lock: PathBuf },
+    /// The lock file could not be created or locked. Fails closed: a slot
+    /// that cannot be claimed is not free.
+    LockUnavailable { lock: PathBuf, error: String },
 }
+
+impl Display for StartRefused {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::RunInFlight { run_id } => write!(
+                f,
+                "a load test is already running: {run_id}. Runs spend from shared accounts, \
+                 so one is admitted at a time. Wait for it, or read its report with \
+                 load_test_report"
+            ),
+            Self::HeldByAnotherProcess { lock } => write!(
+                f,
+                "another axe mcp process on this machine is running a load test (lock held \
+                 at {}). Runs spend from shared accounts, so one is admitted at a time; wait \
+                 for it to finish",
+                lock.display()
+            ),
+            Self::LockUnavailable { lock, error } => {
+                write!(
+                    f,
+                    "could not take the run lock at {}: {error}",
+                    lock.display()
+                )
+            }
+        }
+    }
+}
+
+/// The file every axe process on this machine locks while a run is in
+/// flight. The lock is released when the run ends, or by the kernel if the
+/// process dies, so a crash cannot leave it stuck.
+const LOCK_FILE: &str = "load-test.lock";
 
 /// Every run identifier starts with this. Anything else in the reports
 /// directory is not a run, whatever its extension.
@@ -137,7 +179,7 @@ impl RunRegistry {
     /// `make_flow` is a closure rather than a future for the same reason: the
     /// future must not exist until it is on the thread that will poll it. It
     /// receives the identifier so the flow can name its report after it.
-    pub fn start<M, F>(&self, make_flow: M) -> Result<String, RunInFlight>
+    pub fn start<M, F>(&self, make_flow: M) -> Result<String, StartRefused>
     where
         M: FnOnce(String) -> F + Send + 'static,
         F: Future<Output = ()>,
@@ -149,14 +191,17 @@ impl RunRegistry {
 
         runs.retain(|_, handle| !handle.is_finished());
         if let Some(run_id) = runs.keys().next() {
-            return Err(RunInFlight {
+            return Err(StartRefused::RunInFlight {
                 run_id: run_id.clone(),
             });
         }
+        let machine_lock = self.lock_machine_slot()?;
 
         let run_id = mint_run_id();
         let flow_id = run_id.clone();
         let handle = tokio::task::spawn_blocking(move || {
+            // Held for as long as the run lives on this thread.
+            let _machine_lock = machine_lock;
             // Nothing to report a build failure to: the caller already holds
             // its identifier and will see the run as unknown, which is
             // accurate.
@@ -171,6 +216,32 @@ impl RunRegistry {
         runs.insert(run_id.clone(), handle);
 
         Ok(run_id)
+    }
+
+    /// Take the machine-wide run slot, without waiting.
+    ///
+    /// An advisory `flock` on a file in the reports directory. The in-memory
+    /// map above answers for this process; this answers for every other axe
+    /// process sharing the data directory, which share the wallets too.
+    fn lock_machine_slot(&self) -> Result<Flock<File>, StartRefused> {
+        let lock = self.reports_dir.join(LOCK_FILE);
+        let unavailable = |error: &dyn Display| StartRefused::LockUnavailable {
+            lock: lock.clone(),
+            error: error.to_string(),
+        };
+
+        std::fs::create_dir_all(&self.reports_dir).map_err(|e| unavailable(&e))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+            .map_err(|e| unavailable(&e))?;
+
+        Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, errno)| match errno {
+            Errno::EWOULDBLOCK => StartRefused::HeldByAnotherProcess { lock: lock.clone() },
+            other => unavailable(&other),
+        })
     }
 
     /// Identifiers of the runs still executing in this process.
@@ -290,7 +361,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{RunInFlight, RunRegistry, RunState, RunStatus, mint_run_id};
+    use super::{RunRegistry, RunState, RunStatus, StartRefused, mint_run_id};
 
     static DIRS: AtomicUsize = AtomicUsize::new(0);
 
@@ -408,7 +479,7 @@ mod tests {
         ));
         assert_eq!(
             registry.start(|_| async {}),
-            Err(RunInFlight {
+            Err(StartRefused::RunInFlight {
                 run_id: first.clone()
             })
         );
@@ -473,5 +544,30 @@ mod tests {
         });
         registry.wait_for_in_flight().await;
         assert!(registry.running().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_second_registry_on_the_same_directory_is_refused_while_a_run_holds_the_lock() {
+        let dir = scratch_reports_dir();
+        let first_server = RunRegistry::new(dir.clone());
+        let second_server = RunRegistry::new(dir.clone());
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+
+        let run_id = first_server
+            .start(move |_| async move {
+                let _ = held.await;
+            })
+            .unwrap();
+        assert_eq!(
+            second_server.start(|_| async {}),
+            Err(StartRefused::HeldByAnotherProcess {
+                lock: dir.join(super::LOCK_FILE)
+            })
+        );
+
+        drop(release);
+        wait_until_finished(&first_server, &run_id).await;
+        let second = second_server.start(|_| async {}).unwrap();
+        wait_until_finished(&second_server, &second).await;
     }
 }
