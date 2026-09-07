@@ -13,6 +13,7 @@ use rmcp::ErrorData;
 use rmcp::model::{CallToolResponse, JsonObject};
 
 use crate::mcp::guidance;
+use crate::mcp::runs::RunId;
 use crate::mcp::server::{AxeMcp, SPEND_TOOLS};
 use crate::types::Network;
 
@@ -88,10 +89,11 @@ pub fn resource_read(uri: &str, found: bool) {
 }
 
 /// The client went away with runs still going; the process stays up for them.
-pub fn draining(run_ids: &[String]) {
+pub fn draining(run_ids: &[RunId]) {
+    let names: Vec<String> = run_ids.iter().map(ToString::to_string).collect();
     line(&format!(
         "client disconnected; waiting for {} to finish before exiting",
-        run_ids.join(", ")
+        names.join(", ")
     ));
 }
 

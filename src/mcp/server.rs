@@ -444,7 +444,7 @@ impl AxeMcp {
         };
 
         let started = self.context.runs().start(move |run_id| {
-            flow_args.run_id = Some(run_id);
+            flow_args.run_id = Some(run_id.to_string());
             async move {
                 // The report artifact records the outcome, including
                 // failure, so nothing is lost by not observing it here.
@@ -644,6 +644,7 @@ impl ServerHandler for AxeMcp {
 mod tests {
     use std::path::PathBuf;
 
+    use rmcp::ServerHandler;
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{ErrorCode, Tool};
     use serde_json::{Value, json};
@@ -871,8 +872,6 @@ mod tests {
 
     #[test]
     fn instructions_state_the_operator_caps() {
-        use rmcp::ServerHandler;
-
         let info = server().get_info();
         let instructions = info.instructions.unwrap_or_default();
         assert!(
@@ -906,8 +905,6 @@ mod tests {
 
     #[test]
     fn server_announces_itself_as_axe() {
-        use rmcp::ServerHandler;
-
         let info = server().get_info();
         assert_eq!(info.server_info.name, "axe");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));

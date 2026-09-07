@@ -33,23 +33,24 @@ use tokio::task::JoinHandle;
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum RunState {
     /// Still executing in this process.
-    Running { run_id: String },
+    Running { run_id: RunId },
     /// Finished, with its report.
     Finished {
-        run_id: String,
+        run_id: RunId,
         report: serde_json::Value,
     },
     /// No report, and not running here. Either it failed before writing one,
     /// or it was started by a server that has since restarted. Deliberately
     /// distinct from running: a caller must not read "no report yet" as
-    /// "still working".
+    /// "still working". Carries the caller's text as given, since it may
+    /// not be a run identifier at all.
     Unknown { run_id: String },
 }
 
 /// One line of the run listing.
 #[derive(Debug, Serialize)]
 pub struct RunListEntry {
-    pub run_id: String,
+    pub run_id: RunId,
     pub state: RunStatus,
 }
 
@@ -64,7 +65,7 @@ pub enum RunStatus {
 /// What a caller gets back when a run is accepted.
 #[derive(Debug, Serialize)]
 pub struct RunStarted {
-    pub run_id: String,
+    pub run_id: RunId,
     pub network: String,
     pub source_chain: String,
     pub destination_chain: String,
@@ -75,7 +76,7 @@ pub struct RunStarted {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartRefused {
     /// This process is already running one.
-    RunInFlight { run_id: String },
+    RunInFlight { run_id: RunId },
     /// Another axe process on this machine holds the run lock.
     HeldByAnotherProcess { lock: PathBuf },
     /// The lock file could not be created or locked. Fails closed: a slot
@@ -117,7 +118,57 @@ const LOCK_FILE: &str = "load-test.lock";
 
 /// Every run identifier starts with this. Anything else in the reports
 /// directory is not a run, whatever its extension.
-pub const RUN_ID_PREFIX: &str = "axe-load-test-";
+const RUN_ID_PREFIX: &str = "axe-load-test-";
+
+/// A run identifier: the prefix plus the milliseconds it was minted at.
+///
+/// Owning the prefix here is what keeps every other file in the reports
+/// directory, the lock file included, from ever reading as a run: a caller's
+/// text becomes a `RunId` only through [`RunId::parse`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RunId(String);
+
+impl RunId {
+    /// Mint an identifier for a new run.
+    ///
+    /// Milliseconds since the epoch, forced strictly increasing within this
+    /// process. That keeps identifiers unique and sortable, so listing newest
+    /// first is a reverse sort rather than a stat of every file.
+    fn mint() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let now = u64::try_from(now).unwrap_or(u64::MAX);
+
+        let previous = LAST_RUN_MILLIS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+                Some(now.max(last.saturating_add(1)))
+            })
+            .unwrap_or(now);
+        let millis = now.max(previous.saturating_add(1));
+
+        Self(format!("{RUN_ID_PREFIX}{millis}"))
+    }
+
+    /// Accept caller-supplied text only if this registry could have minted it.
+    pub fn parse(text: &str) -> Option<Self> {
+        text.starts_with(RUN_ID_PREFIX)
+            .then(|| Self(text.to_string()))
+    }
+
+    /// The run a report file belongs to, or `None` for any other file.
+    fn from_report_file_name(name: &str) -> Option<Self> {
+        name.strip_suffix(".json").and_then(Self::parse)
+    }
+}
+
+impl Display for RunId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.write_str(&self.0)
+    }
+}
 
 /// How often a draining server checks whether its runs have finished.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -126,33 +177,11 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// still get distinct, ordered identifiers.
 static LAST_RUN_MILLIS: AtomicU64 = AtomicU64::new(0);
 
-/// Mint an identifier for a new run.
-///
-/// Milliseconds since the epoch, forced strictly increasing within this
-/// process. That keeps identifiers unique and sortable, so listing newest
-/// first is a reverse sort rather than a stat of every file.
-fn mint_run_id() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let now = u64::try_from(now).unwrap_or(u64::MAX);
-
-    let previous = LAST_RUN_MILLIS
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
-            Some(now.max(last.saturating_add(1)))
-        })
-        .unwrap_or(now);
-    let millis = now.max(previous.saturating_add(1));
-
-    format!("{RUN_ID_PREFIX}{millis}")
-}
-
 /// Tracks load-test runs started through this server.
 #[derive(Clone)]
 pub struct RunRegistry {
     reports_dir: PathBuf,
-    in_flight: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    in_flight: Arc<Mutex<HashMap<RunId, JoinHandle<()>>>>,
 }
 
 impl RunRegistry {
@@ -179,9 +208,9 @@ impl RunRegistry {
     /// `make_flow` is a closure rather than a future for the same reason: the
     /// future must not exist until it is on the thread that will poll it. It
     /// receives the identifier so the flow can name its report after it.
-    pub fn start<M, F>(&self, make_flow: M) -> Result<String, StartRefused>
+    pub fn start<M, F>(&self, make_flow: M) -> Result<RunId, StartRefused>
     where
-        M: FnOnce(String) -> F + Send + 'static,
+        M: FnOnce(RunId) -> F + Send + 'static,
         F: Future<Output = ()>,
     {
         let mut runs = self
@@ -197,7 +226,7 @@ impl RunRegistry {
         }
         let machine_lock = self.lock_machine_slot()?;
 
-        let run_id = mint_run_id();
+        let run_id = RunId::mint();
         let flow_id = run_id.clone();
         let handle = tokio::task::spawn_blocking(move || {
             // Held for as long as the run lives on this thread.
@@ -245,7 +274,7 @@ impl RunRegistry {
     }
 
     /// Identifiers of the runs still executing in this process.
-    pub fn running(&self) -> Vec<String> {
+    pub fn running(&self) -> Vec<RunId> {
         self.in_flight
             .lock()
             .map(|runs| {
@@ -269,7 +298,7 @@ impl RunRegistry {
     }
 
     /// Whether a run is still executing in this process.
-    fn is_running(&self, run_id: &str) -> bool {
+    fn is_running(&self, run_id: &RunId) -> bool {
         self.in_flight
             .lock()
             .is_ok_and(|runs| runs.get(run_id).is_some_and(|h| !h.is_finished()))
@@ -280,29 +309,24 @@ impl RunRegistry {
     /// Only identifiers this registry could have minted are looked up, so a
     /// caller cannot read an arbitrary file in the reports directory as a
     /// report.
-    pub async fn state(&self, run_id: &str) -> RunState {
-        if !run_id.starts_with(RUN_ID_PREFIX) {
+    pub async fn state(&self, text: &str) -> RunState {
+        let Some(run_id) = RunId::parse(text) else {
             return RunState::Unknown {
-                run_id: run_id.to_string(),
+                run_id: text.to_string(),
             };
+        };
+        if let Some(report) = self.read_report(&run_id).await {
+            return RunState::Finished { run_id, report };
         }
-        if let Some(report) = self.read_report(run_id).await {
-            return RunState::Finished {
-                run_id: run_id.to_string(),
-                report,
-            };
-        }
-        if self.is_running(run_id) {
-            return RunState::Running {
-                run_id: run_id.to_string(),
-            };
+        if self.is_running(&run_id) {
+            return RunState::Running { run_id };
         }
         RunState::Unknown {
-            run_id: run_id.to_string(),
+            run_id: text.to_string(),
         }
     }
 
-    async fn read_report(&self, run_id: &str) -> Option<serde_json::Value> {
+    async fn read_report(&self, run_id: &RunId) -> Option<serde_json::Value> {
         let path = self.reports_dir.join(format!("{run_id}.json"));
         let text = tokio::fs::read_to_string(path).await.ok()?;
         serde_json::from_str(&text).ok()
@@ -317,10 +341,9 @@ impl RunRegistry {
 
         if let Ok(mut entries) = tokio::fs::read_dir(&self.reports_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(id) = entry.file_name().to_string_lossy().strip_suffix(".json")
-                    && id.starts_with(RUN_ID_PREFIX)
+                if let Some(id) = RunId::from_report_file_name(&entry.file_name().to_string_lossy())
                 {
-                    ids.push(id.to_string());
+                    ids.push(id);
                 }
             }
         }
@@ -361,7 +384,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{RunRegistry, RunState, RunStatus, StartRefused, mint_run_id};
+    use super::{RunId, RunRegistry, RunState, RunStatus, StartRefused};
 
     static DIRS: AtomicUsize = AtomicUsize::new(0);
 
@@ -380,7 +403,7 @@ mod tests {
         std::fs::write(dir.join(format!("{run_id}.json")), report.to_string()).unwrap();
     }
 
-    async fn wait_until_finished(registry: &RunRegistry, run_id: &str) {
+    async fn wait_until_finished(registry: &RunRegistry, run_id: &RunId) {
         for _ in 0..500 {
             if !registry.is_running(run_id) {
                 return;
@@ -392,7 +415,7 @@ mod tests {
 
     #[test]
     fn run_ids_are_unique_and_ascending_within_a_burst() {
-        let ids: Vec<String> = (0..50).map(|_| mint_run_id()).collect();
+        let ids: Vec<RunId> = (0..50).map(|_| RunId::mint()).collect();
         for pair in ids.windows(2) {
             assert!(
                 pair[0] < pair[1],
@@ -424,7 +447,7 @@ mod tests {
                 run_id,
                 report: read,
             } => {
-                assert_eq!(run_id, "axe-load-test-1700000000000");
+                assert_eq!(run_id.to_string(), "axe-load-test-1700000000000");
                 assert_eq!(read, report);
             }
             other => panic!("expected finished, got {other:?}"),
@@ -451,7 +474,10 @@ mod tests {
         let registry = RunRegistry::new(dir);
 
         let listed = registry.list().await;
-        let ids: Vec<&str> = listed.iter().map(|entry| entry.run_id.as_str()).collect();
+        let ids: Vec<String> = listed
+            .iter()
+            .map(|entry| entry.run_id.to_string())
+            .collect();
         assert_eq!(
             ids,
             ["axe-load-test-1700000000002", "axe-load-test-1700000000001"]
@@ -474,7 +500,7 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            registry.state(&first).await,
+            registry.state(&first.to_string()).await,
             RunState::Running { .. }
         ));
         assert_eq!(
@@ -496,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn flow_receives_the_identifier_it_was_started_under() {
         let registry = RunRegistry::new(scratch_reports_dir());
-        let (send_id, seen_id) = tokio::sync::oneshot::channel::<String>();
+        let (send_id, seen_id) = tokio::sync::oneshot::channel::<RunId>();
 
         let run_id = registry
             .start(move |id| async move {
@@ -514,11 +540,10 @@ mod tests {
         write_report(&dir, "axe-load-test-1700000000001", &json!({}));
         let registry = RunRegistry::new(dir);
 
-        let ids: Vec<String> = registry
-            .list()
-            .await
-            .into_iter()
-            .map(|entry| entry.run_id)
+        let listed = registry.list().await;
+        let ids: Vec<String> = listed
+            .iter()
+            .map(|entry| entry.run_id.to_string())
             .collect();
         assert_eq!(ids, ["axe-load-test-1700000000001"]);
         assert!(matches!(
