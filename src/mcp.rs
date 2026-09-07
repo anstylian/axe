@@ -11,6 +11,7 @@ use serde_json::json;
 use crate::commands::load_test;
 use crate::mcp::context::McpContext;
 use crate::mcp::policy::{SpendLimits, SpendPolicy};
+use crate::mcp::runs::RunRegistry;
 use crate::mcp::server::{AxeMcp, SPEND_TOOLS};
 use crate::mcp::transport::Endpoint;
 use crate::types::Network;
@@ -42,9 +43,10 @@ pub async fn serve(
     let reports_dir = report_dir();
     load_test::set_report_dir(reports_dir.clone());
 
-    // The spend ledger sits next to the reports it accounts for, so a
-    // lifetime budget survives a restart.
-    let policy = SpendPolicy::persistent(limits, reports_dir.join("spend-ledger.json"))?;
+    // The spend ledger lives beside the reports directory, not inside it: the
+    // run registry treats every report file in there as a run.
+    let ledger = data_root().join("spend-ledger.json");
+    let policy = SpendPolicy::persistent(limits, ledger.clone())?;
     let context = McpContext::new(network, allow_mainnet, reports_dir.clone(), policy)?;
 
     activity::startup(&activity::Startup {
@@ -55,8 +57,28 @@ pub async fn serve(
         },
         caps: context.policy().describe(),
         reports_dir,
+        ledger,
     });
-    transport::serve(AxeMcp::new(context), endpoint).await
+    transport::serve(AxeMcp::new(context.clone()), endpoint).await?;
+
+    finish_in_flight_runs(context.runs()).await;
+    Ok(())
+}
+
+/// Stay alive until running load tests finish.
+///
+/// On stdio the transport returns when the client disconnects, and the
+/// process would exit with it. A run in flight has usually spent funds
+/// already; exiting now would lose its report. Over HTTP the transport does
+/// not return normally, so this is reached only when it fails.
+async fn finish_in_flight_runs(runs: &RunRegistry) {
+    let running = runs.running();
+    if running.is_empty() {
+        return;
+    }
+    activity::draining(&running);
+    runs.wait_for_in_flight().await;
+    activity::drained();
 }
 
 /// Print what the server offers: every tool with the first sentence of its
@@ -109,10 +131,14 @@ fn first_sentence(text: &str) -> String {
 /// Deliberately not the CLI's working-directory-relative location, which
 /// existing scripts glob and which must keep working unchanged.
 fn report_dir() -> PathBuf {
+    data_root().join("load-test-runs")
+}
+
+/// The per-user data directory axe already uses for its caches.
+fn data_root() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("axe")
-        .join("load-test-runs")
 }
 
 #[cfg(test)]

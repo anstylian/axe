@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::task::JoinHandle;
@@ -73,6 +73,13 @@ pub struct RunInFlight {
     pub run_id: String,
 }
 
+/// Every run identifier starts with this. Anything else in the reports
+/// directory is not a run, whatever its extension.
+pub const RUN_ID_PREFIX: &str = "axe-load-test-";
+
+/// How often a draining server checks whether its runs have finished.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 /// The last identifier minted, so two runs started in the same millisecond
 /// still get distinct, ordered identifiers.
 static LAST_RUN_MILLIS: AtomicU64 = AtomicU64::new(0);
@@ -96,7 +103,7 @@ fn mint_run_id() -> String {
         .unwrap_or(now);
     let millis = now.max(previous.saturating_add(1));
 
-    format!("axe-load-test-{millis}")
+    format!("{RUN_ID_PREFIX}{millis}")
 }
 
 /// Tracks load-test runs started through this server.
@@ -166,6 +173,30 @@ impl RunRegistry {
         Ok(run_id)
     }
 
+    /// Identifiers of the runs still executing in this process.
+    pub fn running(&self) -> Vec<String> {
+        self.in_flight
+            .lock()
+            .map(|runs| {
+                runs.iter()
+                    .filter(|(_, handle)| !handle.is_finished())
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Wait until nothing is executing in this process.
+    ///
+    /// For a stdio server whose client has gone: exiting now would take a run
+    /// that has already spent funds with it and leave no report. Polling is
+    /// enough, since nothing else is happening by then.
+    pub async fn wait_for_in_flight(&self) {
+        while !self.running().is_empty() {
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+        }
+    }
+
     /// Whether a run is still executing in this process.
     fn is_running(&self, run_id: &str) -> bool {
         self.in_flight
@@ -174,7 +205,16 @@ impl RunRegistry {
     }
 
     /// The state of one run, reading its artifact if it has landed.
+    ///
+    /// Only identifiers this registry could have minted are looked up, so a
+    /// caller cannot read an arbitrary file in the reports directory as a
+    /// report.
     pub async fn state(&self, run_id: &str) -> RunState {
+        if !run_id.starts_with(RUN_ID_PREFIX) {
+            return RunState::Unknown {
+                run_id: run_id.to_string(),
+            };
+        }
         if let Some(report) = self.read_report(run_id).await {
             return RunState::Finished {
                 run_id: run_id.to_string(),
@@ -206,7 +246,9 @@ impl RunRegistry {
 
         if let Ok(mut entries) = tokio::fs::read_dir(&self.reports_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(id) = entry.file_name().to_string_lossy().strip_suffix(".json") {
+                if let Some(id) = entry.file_name().to_string_lossy().strip_suffix(".json")
+                    && id.starts_with(RUN_ID_PREFIX)
+                {
                     ids.push(id.to_string());
                 }
             }
@@ -392,5 +434,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(seen_id.await.unwrap(), run_id);
+    }
+
+    #[tokio::test]
+    async fn files_without_the_run_prefix_are_not_runs() {
+        let dir = scratch_reports_dir();
+        std::fs::write(dir.join("spend-ledger.json"), r#"{"transactions":2}"#).unwrap();
+        write_report(&dir, "axe-load-test-1700000000001", &json!({}));
+        let registry = RunRegistry::new(dir);
+
+        let ids: Vec<String> = registry
+            .list()
+            .await
+            .into_iter()
+            .map(|entry| entry.run_id)
+            .collect();
+        assert_eq!(ids, ["axe-load-test-1700000000001"]);
+        assert!(matches!(
+            registry.state("spend-ledger").await,
+            RunState::Unknown { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_in_flight_runs_returns_once_they_finish() {
+        let registry = RunRegistry::new(scratch_reports_dir());
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let run_id = registry
+            .start(move |_| async move {
+                let _ = held.await;
+            })
+            .unwrap();
+        assert_eq!(registry.running(), [run_id]);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(release);
+        });
+        registry.wait_for_in_flight().await;
+        assert!(registry.running().is_empty());
     }
 }

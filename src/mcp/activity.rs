@@ -26,6 +26,7 @@ pub struct Startup {
     pub endpoint: String,
     pub caps: String,
     pub reports_dir: PathBuf,
+    pub ledger: PathBuf,
 }
 
 /// Print the banner: network, endpoint, caps, artifacts, and the catalogue.
@@ -38,9 +39,10 @@ pub fn startup(startup: &Startup) {
     line(&format!("endpoint: {}", startup.endpoint));
     line(&startup.caps);
     line(&format!(
-        "load-test reports and spend ledger: {}",
+        "load-test reports: {}",
         startup.reports_dir.display()
     ));
+    line(&format!("spend ledger: {}", startup.ledger.display()));
 
     let tools = AxeMcp::catalogue();
     let names: Vec<String> = tools
@@ -85,6 +87,19 @@ pub fn resource_read(uri: &str, found: bool) {
     line(&format!("resource {uri} {outcome}"));
 }
 
+/// The client went away with runs still going; the process stays up for them.
+pub fn draining(run_ids: &[String]) {
+    line(&format!(
+        "client disconnected; waiting for {} to finish before exiting",
+        run_ids.join(", ")
+    ));
+}
+
+/// Every run finished; the process can exit.
+pub fn drained() {
+    line("all runs finished; exiting");
+}
+
 fn tool_call_line(
     name: &str,
     arguments: Option<&JsonObject>,
@@ -98,7 +113,8 @@ fn tool_call_line(
         Ok(CallToolResponse::Complete(_)) => "ok".to_string(),
         // Input required or a task handle: the call is not finished yet.
         Ok(_) => "pending".to_string(),
-        Err(e) => format!("refused: {}", e.message),
+        // Error text can span lines; the log is one line per request.
+        Err(e) => format!("refused: {}", fold(&e.message)),
     };
     let args = arguments
         .filter(|a| !a.is_empty())
@@ -107,6 +123,11 @@ fn tool_call_line(
         .unwrap_or_default();
 
     format!("tool {name} {}ms {outcome}{args}", elapsed.as_millis())
+}
+
+/// Collapse line breaks and runs of spaces into single spaces.
+fn fold(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn truncate(text: &str) -> String {
@@ -167,6 +188,20 @@ mod tests {
                 Duration::from_millis(2)
             ),
             "tool start_load_test 2ms refused: 11 transactions exceed the cap"
+        );
+    }
+
+    #[test]
+    fn multi_line_errors_stay_on_one_line() {
+        let result = Err(ErrorData::internal_error(
+            "block lookup failed: rpc said\n  status 500\n  retry later",
+            None,
+        ));
+        let logged = tool_call_line("info_block", None, &result, Duration::from_millis(7));
+        assert!(!logged.contains('\n'), "{logged}");
+        assert_eq!(
+            logged,
+            "tool info_block 7ms refused: block lookup failed: rpc said status 500 retry later"
         );
     }
 

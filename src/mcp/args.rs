@@ -32,8 +32,9 @@ pub struct BlockArgs {
 pub struct RouteArgs {
     /// gmp for callContract, its for interchainTransfer, or its-with-data.
     pub protocol: Protocol,
-    /// The chain-type pairing, for example sol-to-evm or evm-to-xrpl.
-    pub route: TestType,
+    /// The chain-type pairing, for example sol-to-evm. Omit to infer it from
+    /// the two chains' types in the pinned network's config.
+    pub route: Option<TestType>,
     /// Source chain axelar id, for example solana.
     pub source_chain: String,
     /// Destination chain axelar id, for example flow.
@@ -119,7 +120,8 @@ pub struct StartLoadTestArgs {
     pub protocol: Option<Protocol>,
     /// The chain-type pairing. Omit to let axe infer it from the config.
     pub route: Option<TestType>,
-    /// How many transactions to send. Defaults to 1.
+    /// How many transactions to send. Defaults to 1, and must be at least 1.
+    #[schemars(range(min = 1))]
     pub num_txs: Option<u64>,
 }
 

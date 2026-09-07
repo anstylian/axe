@@ -90,19 +90,30 @@ impl AxeMcp {
     }
 
     /// Check whether a cross-chain route can be attempted, before spending
-    /// anything on it. Reach for this first: an unsupported pairing fails
-    /// partway through a flow, after funds have already moved.
+    /// anything on it. Both chains are resolved against the pinned network's
+    /// config, and the pairing is inferred from their types when omitted, so
+    /// an unknown chain comes back unsupported with the reason. Reach for this
+    /// first: an unsupported pairing fails partway through a flow, after funds
+    /// have already moved.
     #[tool(name = "check_route")]
     pub async fn check_route(
         &self,
         Parameters(args): Parameters<RouteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let support = guidance::check_route(
+        let network = self.context.network();
+        let config = config_source::resolve(network, None)
+            .await
+            .map_err(|e| to_error_data("could not resolve the chains config", &e))?
+            .into_path();
+
+        let support = guidance::check_route_in_config(
+            &config,
             args.protocol,
             args.route,
             &args.source_chain,
             &args.destination_chain,
-        );
+        )
+        .await;
 
         let verdict = if support.supported {
             "is supported"
@@ -406,6 +417,15 @@ impl AxeMcp {
         let network = self.context.network();
         let policy = self.context.policy();
 
+        // The schema says at least one, but a schema is advice to the client,
+        // not a check.
+        if args.num_txs() == 0 {
+            return Err(ErrorData::invalid_params(
+                "num_txs must be at least 1",
+                None,
+            ));
+        }
+
         // Refused before anything is resolved or signed: these are the
         // operator's caps, and no argument can move them.
         policy
@@ -636,8 +656,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{AxeMcp, SPEND_TOOLS};
-    use crate::commands::load_test::{Protocol, TestType};
-    use crate::mcp::args::{BlockArgs, RouteArgs, RunArgs, StartLoadTestArgs, TxArgs};
+    use crate::mcp::args::{BlockArgs, RunArgs, StartLoadTestArgs, TxArgs};
     use crate::mcp::context::McpContext;
     use crate::mcp::policy::{SpendLimits, SpendPolicy};
     use crate::types::Network;
@@ -780,23 +799,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_check_returns_summary_and_structured_verdict() {
-        let result = server()
-            .check_route(Parameters(RouteArgs {
-                protocol: Protocol::Gmp,
-                route: TestType::SolToEvm,
-                source_chain: "solana".into(),
-                destination_chain: "flow".into(),
-            }))
+    async fn load_test_with_zero_transactions_is_refused() {
+        let err = server()
+            .start_load_test(load_test("solana", "flow", 0))
             .await
-            .unwrap();
+            .expect_err("a run of nothing must be refused");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("at least 1"), "{}", err.message);
+    }
 
-        let summary = result.content[0].as_text().unwrap().text.as_str();
-        assert!(summary.starts_with("gmp solana -> flow is"), "{summary}");
-        let verdict = result.structured_content.unwrap();
-        assert_eq!(verdict["protocol"], "gmp");
-        assert_eq!(verdict["route"], "sol-to-evm");
-        assert!(verdict["supported"].is_boolean());
+    #[test]
+    fn load_test_schema_requires_at_least_one_transaction() {
+        let tool = tools()
+            .into_iter()
+            .find(|t| t.name == "start_load_test")
+            .unwrap();
+        let schema = Value::Object((*tool.input_schema).clone());
+        assert_eq!(schema["properties"]["num_txs"]["minimum"], 1, "{schema}");
     }
 
     #[tokio::test]
