@@ -1591,6 +1591,7 @@ mod tests {
         let chain = ChainConfig {
             axelar_id: None,
             name: None,
+            evm_chain_id: None,
             rpc: None,
             wss_rpc: None,
             network_type: None,
