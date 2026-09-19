@@ -73,12 +73,7 @@ pub async fn run_config(
     recent: usize,
     timeout_secs: u64,
 ) -> Result<()> {
-    let base = gmp_api::base_url(network).ok_or_else(|| {
-        eyre::eyre!(
-            "network {} has no Axelarscan GMP API deployment",
-            network.as_str()
-        )
-    })?;
+    let base = api_base(network)?;
 
     ui::section("Express Execution Monitor");
     ui::kv("network", network.as_str());
@@ -398,6 +393,16 @@ fn express_phases(record: &ExpressRecord) -> ExpressPhases {
     }
 }
 
+/// The Axelarscan GMP API this network is served by.
+fn api_base(network: Network) -> Result<&'static str> {
+    gmp_api::base_url(network).ok_or_else(|| {
+        eyre!(
+            "network {} has no Axelarscan GMP API deployment",
+            network.as_str()
+        )
+    })
+}
+
 /// Scan recent express transfers on one or more chains, without printing.
 ///
 /// Observe-only: this reads the Axelarscan GMP API and spends nothing, which
@@ -407,12 +412,7 @@ pub(crate) async fn resolve_scan(
     chains: &[String],
     recent: usize,
 ) -> Result<Vec<ExpressPhases>> {
-    let base = gmp_api::base_url(network).ok_or_else(|| {
-        eyre::eyre!(
-            "network {} has no Axelarscan GMP API deployment",
-            network.as_str()
-        )
-    })?;
+    let base = api_base(network)?;
 
     let recent = if recent == 0 { DEFAULT_RECENT } else { recent };
     let mut out = Vec::new();
@@ -421,4 +421,117 @@ pub(crate) async fn resolve_scan(
         out.extend(records.iter().map(express_phases));
     }
     Ok(out)
+}
+
+/// Where a watched transfer had got to when the watch stopped.
+///
+/// A ceiling reached is a state, not a failure: the MCP watch waits far less
+/// than the CLI does, so "still waiting" is the ordinary answer and the caller
+/// is expected to ask again. Only the two verdicts that can never improve --
+/// a refusal, and a reimbursement that arrived short -- are terminal failures.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub(crate) enum WatchOutcome {
+    /// The GMP API has no record of the transaction yet.
+    NotIndexed,
+    /// Axelar ruled the message out for express execution.
+    Refused { reason: String },
+    /// Indexed, but no executor has fronted the funds yet.
+    AwaitingExpressExecution,
+    /// Fronted, waiting for the canonical execute to pay the executor back.
+    AwaitingReimbursement,
+    /// Fronted and reimbursed in full.
+    Reimbursed,
+    /// Reimbursed, but not for what was fronted.
+    ReimbursementShort { reason: String },
+}
+
+impl WatchOutcome {
+    /// Whether waiting longer could still change this.
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused { .. } | Self::Reimbursed | Self::ReimbursementShort { .. }
+        )
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::NotIndexed => "not indexed by the GMP API yet",
+            Self::Refused { .. } => "ruled out for express execution",
+            Self::AwaitingExpressExecution => "waiting for an executor to front the funds",
+            Self::AwaitingReimbursement => "waiting for the canonical execute to reimburse",
+            Self::Reimbursed => "reimbursed in full",
+            Self::ReimbursementShort { .. } => "reimbursed short",
+        }
+    }
+}
+
+/// One transfer watched through both phases, as data.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ExpressWatch {
+    pub source_tx: String,
+    #[serde(flatten)]
+    pub outcome: WatchOutcome,
+    pub waited_seconds: u64,
+    /// Absent until the GMP API has indexed the transaction.
+    pub phases: Option<ExpressPhases>,
+}
+
+/// Watch one source transaction through both express phases, without printing.
+///
+/// Polls until the outcome is terminal or `wait` runs out, whichever comes
+/// first. Unlike the CLI's monitor, running out of time is reported rather
+/// than raised: the caller is expected to ask again.
+pub(crate) async fn resolve_watch(
+    network: Network,
+    source_tx: &str,
+    wait: std::time::Duration,
+) -> Result<ExpressWatch> {
+    let base = api_base(network)?;
+    let start = Instant::now();
+    let deadline = start + wait;
+
+    loop {
+        let (outcome, phases) = watch_once(base, source_tx).await?;
+
+        if outcome.is_terminal() || Instant::now() >= deadline {
+            return Ok(ExpressWatch {
+                source_tx: source_tx.to_string(),
+                outcome,
+                waited_seconds: start.elapsed().as_secs(),
+                phases,
+            });
+        }
+
+        tokio::time::sleep(EXPRESS_POLL_INTERVAL).await;
+    }
+}
+
+/// One poll of the GMP API, classified.
+async fn watch_once(base: &str, source_tx: &str) -> Result<(WatchOutcome, Option<ExpressPhases>)> {
+    let Some(record) = gmp_api::search_by_tx(base, source_tx).await? else {
+        return Ok((WatchOutcome::NotIndexed, None));
+    };
+
+    if let Some(reason) = record.express_refusal() {
+        return Ok((
+            WatchOutcome::Refused { reason },
+            Some(express_phases(&record)),
+        ));
+    }
+
+    let outcome = match record.phase_status() {
+        (Phase1::NotObserved, _) => WatchOutcome::AwaitingExpressExecution,
+        (Phase1::Executed { .. }, Phase2::Reimbursed { .. }) => {
+            let check = record.reimbursement_amount_check();
+            match amount_check_failure(check.as_ref()) {
+                Some(reason) => WatchOutcome::ReimbursementShort { reason },
+                None => WatchOutcome::Reimbursed,
+            }
+        }
+        (Phase1::Executed { .. }, _) => WatchOutcome::AwaitingReimbursement,
+    };
+
+    Ok((outcome, Some(express_phases(&record))))
 }

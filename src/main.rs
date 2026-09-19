@@ -39,16 +39,15 @@ async fn run_deploy(
             artifact_path,
             salt,
             proxy_artifact_path,
-        } => {
-            commands::deploy::run(
-                axelar_id,
-                private_key,
-                artifact_path,
-                salt,
-                proxy_artifact_path,
-            )
-            .await
-        }
+        } => commands::deploy::run(
+            axelar_id,
+            private_key,
+            artifact_path,
+            salt,
+            proxy_artifact_path,
+        )
+        .await
+        .map(|_| ()),
         cli::DeployCommands::Reset { axelar_id } => commands::reset::run(axelar_id).await,
         cli::DeployCommands::SenderReceiver {
             config,
@@ -124,60 +123,31 @@ async fn originate_express_transfer(
     config: Option<&std::path::Path>,
     inputs: OriginateInputs,
 ) -> Result<String> {
-    use commands::express_originate::{
-        OriginateArgs, default_app_proxy, default_symbols, originate,
-    };
-
     let source_chain = inputs
         .source_chain
         .ok_or_else(|| eyre::eyre!("--originate requires --source-chain"))?;
     let destination_chain = inputs
         .destination_chain
         .ok_or_else(|| eyre::eyre!("--originate requires --destination-chain"))?;
-    let key = inputs
+    let private_key = inputs
         .private_key
         .ok_or_else(|| eyre::eyre!("--originate requires EVM_PRIVATE_KEY or --private-key"))?;
 
-    let config_path = match config {
-        Some(path) => path.to_path_buf(),
-        None => config_source::resolve(network, None).await?.into_path(),
-    };
-    let chains = config::ChainsConfig::load(&config_path).await?;
-    let chain = chains.chain(&source_chain)?;
-    let gateway: alloy::primitives::Address = chain
-        .contract_address(config::ChainContract::AxelarGateway, &source_chain)?
-        .parse()?;
-
-    let rpc = inputs
-        .source_rpc
-        .or_else(|| chain.rpc.clone())
-        .ok_or_else(|| eyre::eyre!("no RPC for source chain '{source_chain}'"))?;
-
-    let signer: alloy::signers::local::PrivateKeySigner = key.trim_start_matches("0x").parse()?;
-    let recipient = signer.address();
-
-    let hash = originate(
-        &signer,
-        OriginateArgs {
-            source_rpc_urls: vec![rpc],
-            source_gateway: gateway,
-            app_address: inputs
-                .app_address
-                .as_deref()
-                .unwrap_or_else(|| default_app_proxy(network))
-                .parse()?,
+    commands::express_originate::originate_from_config(
+        network,
+        config,
+        commands::express_originate::OriginateInputs {
+            source_chain,
             destination_chain,
-            symbols: inputs
-                .symbol
-                .map(|s| vec![s])
-                .unwrap_or_else(|| default_symbols(network)),
-            amount: inputs.amount.parse()?,
-            recipient,
-            gas_value_wei: inputs.gas_value.parse()?,
+            amount: inputs.amount,
+            gas_value: inputs.gas_value,
+            app_address: inputs.app_address,
+            symbol: inputs.symbol,
+            private_key,
+            source_rpc: inputs.source_rpc,
         },
     )
-    .await?;
-    Ok(format!("{hash:#x}"))
+    .await
 }
 
 async fn run_gmp_test(
@@ -428,7 +398,7 @@ async fn run_cli() -> Result<()> {
         } => mcp::list(json),
         cli::Commands::Mcp {
             action: None,
-            allow_mainnet,
+            deny_mainnet,
             max_txs_per_run,
             max_txs_total,
             allow_chains,
@@ -451,7 +421,7 @@ async fn run_cli() -> Result<()> {
                 },
                 None => mcp::transport::Endpoint::Stdio,
             };
-            mcp::serve(network, allow_mainnet, limits, endpoint).await
+            mcp::serve(network, deny_mainnet, limits, endpoint).await
         }
         cli::Commands::Test { subcommand } => run_test(subcommand, cli.network).await,
         cli::Commands::Bench { subcommand } => commands::bench::run(subcommand).await,
@@ -484,6 +454,7 @@ async fn run_intents(
                 recipient: options.recipient,
             })
             .await
+            .map(|_| ())
         }
         cli::IntentsCommands::Roundtrip(options) => {
             let runtime = resolve_intent_runtime_config(options.runtime, global, true).await?;
@@ -495,7 +466,9 @@ async fn run_intents(
                 options.route.order_type,
                 options.route.assets.asset_type,
             )?;
-            commands::intents::roundtrip(commands::intents::RoundtripArgs { runtime, route }).await
+            commands::intents::roundtrip(commands::intents::RoundtripArgs { runtime, route })
+                .await
+                .map(|_| ())
         }
         cli::IntentsCommands::Sweep(options) => {
             let runtime = resolve_intent_runtime_config(options.runtime, global, true).await?;
@@ -507,8 +480,11 @@ async fn run_intents(
                 wallet_bps: options.wallet_bps,
                 order_type: options.order_type,
                 asset_type: options.assets.asset_type,
+                // The CLI bounds a sweep by its sweep count alone.
+                max_intents: None,
             })
             .await
+            .map(|_| ())
         }
         cli::IntentsCommands::Traffic(options) => {
             let runtime = resolve_intent_runtime_config(options.runtime, global, true).await?;
@@ -516,8 +492,12 @@ async fn run_intents(
                 runtime,
                 wallet_bps: options.wallet_bps,
                 asset_type: options.assets.asset_type,
+                // The CLI's traffic runs until it is interrupted.
+                duration: None,
+                max_intents: None,
             })
             .await
+            .map(|_| ())
         }
         cli::IntentsCommands::Stress(options) => {
             let runtime = resolve_intent_runtime(options.runtime, global).await?;
@@ -534,7 +514,8 @@ async fn run_intents(
                 min_native_balance: options.min_native_balance,
                 json: options.json,
             })
-            .await
+            .await?
+            .into_result()
         }
     }
 }

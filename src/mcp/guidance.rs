@@ -47,6 +47,12 @@ const DOC_PAGES: &[DocPage] = &[
         body: include_str!("../../docs/load-test-coverage.md"),
     },
     DocPage {
+        file: "intents.md",
+        title: "Intents",
+        description: "RFQ routes, quotes, and the flows that spend on them",
+        body: include_str!("../../docs/intents.md"),
+    },
+    DocPage {
         file: "decode.md",
         title: "Decoding",
         description: "Calldata, transactions, and on-chain activity",

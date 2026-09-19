@@ -1,10 +1,11 @@
-//! Background load-test runs and their report artifacts.
+//! Background runs and their report artifacts.
 //!
-//! A load test can run far longer than a client will hold a request open, and
-//! a client that times out is expected to cancel. Cancelling a flow that has
-//! already submitted transactions loses the record of money already spent, so
-//! these runs detach: starting one returns an identifier, and the report is
-//! read back once it lands.
+//! A load test, an intent sweep or a traffic simulation can run far longer
+//! than a client will hold a request open, and a client that times out is
+//! expected to cancel. Cancelling a flow that has already submitted
+//! transactions loses the record of money already spent, so these runs
+//! detach: starting one returns an identifier, and the report is read back
+//! once it lands.
 //!
 //! Finished runs persist a JSON report named after their identifier, so the
 //! artifact on disk is the store. This registry tracks only what is still in
@@ -19,7 +20,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -51,6 +52,7 @@ pub enum RunState {
 #[derive(Debug, Serialize)]
 pub struct RunListEntry {
     pub run_id: RunId,
+    pub kind: Option<RunKind>,
     pub state: RunStatus,
 }
 
@@ -62,7 +64,7 @@ pub enum RunStatus {
     Finished,
 }
 
-/// What a caller gets back when a run is accepted.
+/// What a caller gets back when a load test is accepted.
 #[derive(Debug, Serialize)]
 pub struct RunStarted {
     pub run_id: RunId,
@@ -72,11 +74,29 @@ pub struct RunStarted {
     pub transactions: u64,
 }
 
+/// What a caller gets back when an intents run is accepted.
+///
+/// Every field is a bound the run will stop at, because an agent that started
+/// one cannot watch it: what it needs back is when this will be over and how
+/// much it may spend before then.
+#[derive(Debug, Serialize)]
+pub struct IntentsRunStarted {
+    pub run_id: RunId,
+    pub network: String,
+    pub flow: RunKind,
+    /// The reservation taken against the operator's budget.
+    pub max_intents: u64,
+    pub sweeps: Option<u64>,
+    pub duration_seconds: Option<u64>,
+}
+
 /// Why a start was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartRefused {
     /// This process is already running one.
     RunInFlight { run_id: RunId },
+    /// A blocking tool in this same server holds the slot.
+    SlotHeldHere,
     /// Another axe process on this machine holds the run lock.
     HeldByAnotherProcess { lock: PathBuf },
     /// The lock file could not be created or locked. Fails closed: a slot
@@ -89,15 +109,20 @@ impl Display for StartRefused {
         match self {
             Self::RunInFlight { run_id } => write!(
                 f,
-                "a load test is already running: {run_id}. Runs spend from shared accounts, \
+                "a run is already in flight: {run_id}. Runs spend from shared accounts, \
                  so one is admitted at a time. Wait for it, or read its report with \
-                 load_test_report"
+                 run_report"
+            ),
+            Self::SlotHeldHere => write!(
+                f,
+                "another tool in this server is spending right now, and flows that spend are \
+                 admitted one at a time. Wait for it to finish"
             ),
             Self::HeldByAnotherProcess { lock } => write!(
                 f,
-                "another axe mcp process on this machine is running a load test (lock held \
-                 at {}). Runs spend from shared accounts, so one is admitted at a time; wait \
-                 for it to finish",
+                "another axe mcp process on this machine is running a flow that spends \
+                 (lock held at {}). Runs spend from shared accounts, so one is admitted at \
+                 a time; wait for it to finish",
                 lock.display()
             ),
             Self::LockUnavailable { lock, error } => {
@@ -114,28 +139,75 @@ impl Display for StartRefused {
 /// The file every axe process on this machine locks while a run is in
 /// flight. The lock is released when the run ends, or by the kernel if the
 /// process dies, so a crash cannot leave it stuck.
-const LOCK_FILE: &str = "load-test.lock";
+const LOCK_FILE: &str = "spend-run.lock";
 
-/// Every run identifier starts with this. Anything else in the reports
-/// directory is not a run, whatever its extension.
-const RUN_ID_PREFIX: &str = "axe-load-test-";
-
-/// A run identifier: the prefix plus the milliseconds it was minted at.
+/// Which flow a run is executing.
 ///
-/// Owning the prefix here is what keeps every other file in the reports
-/// directory, the lock file included, from ever reading as a run: a caller's
-/// text becomes a `RunId` only through [`RunId::parse`].
+/// The kind is carried in the identifier rather than beside it, so a report
+/// file found on disk after a restart still says what produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunKind {
+    LoadTest,
+    IntentsSend,
+    IntentsRoundtrip,
+    IntentsSweep,
+    IntentsTraffic,
+    IntentsStress,
+}
+
+impl RunKind {
+    /// Every kind, so parsing and listing cannot miss one.
+    const ALL: &'static [Self] = &[
+        Self::LoadTest,
+        Self::IntentsSend,
+        Self::IntentsRoundtrip,
+        Self::IntentsSweep,
+        Self::IntentsTraffic,
+        Self::IntentsStress,
+    ];
+
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::LoadTest => "load-test",
+            Self::IntentsSend => "intents-send",
+            Self::IntentsRoundtrip => "intents-roundtrip",
+            Self::IntentsSweep => "intents-sweep",
+            Self::IntentsTraffic => "intents-traffic",
+            Self::IntentsStress => "intents-stress",
+        }
+    }
+
+    /// What every identifier of this kind starts with. Anything in the
+    /// reports directory carrying no kind's prefix is not a run, whatever its
+    /// extension.
+    fn prefix(self) -> String {
+        format!("axe-{}-", self.slug())
+    }
+}
+
+impl Display for RunKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.write_str(self.slug())
+    }
+}
+
+/// A run identifier: the kind's prefix plus the milliseconds it was minted at.
+///
+/// Owning the prefixes here is what keeps every other file in the reports
+/// directory, the lock file and the spend ledger included, from ever reading
+/// as a run: a caller's text becomes a `RunId` only through [`RunId::parse`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct RunId(String);
 
 impl RunId {
-    /// Mint an identifier for a new run.
+    /// Mint an identifier for a new run of `kind`.
     ///
     /// Milliseconds since the epoch, forced strictly increasing within this
     /// process. That keeps identifiers unique and sortable, so listing newest
     /// first is a reverse sort rather than a stat of every file.
-    fn mint() -> Self {
+    fn mint(kind: RunKind) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -149,13 +221,34 @@ impl RunId {
             .unwrap_or(now);
         let millis = now.max(previous.saturating_add(1));
 
-        Self(format!("{RUN_ID_PREFIX}{millis}"))
+        Self(format!("{}{millis}", kind.prefix()))
     }
 
     /// Accept caller-supplied text only if this registry could have minted it.
     pub fn parse(text: &str) -> Option<Self> {
-        text.starts_with(RUN_ID_PREFIX)
-            .then(|| Self(text.to_string()))
+        Self::kind_of(text).map(|_| Self(text.to_string()))
+    }
+
+    /// The flow an identifier names.
+    fn kind_of(text: &str) -> Option<RunKind> {
+        RunKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| text.starts_with(&kind.prefix()))
+    }
+
+    pub fn kind(&self) -> Option<RunKind> {
+        Self::kind_of(&self.0)
+    }
+
+    /// When this was minted, for ordering runs of different kinds against
+    /// each other. Sorting the identifiers as text would group them by flow
+    /// instead, and the listing promises newest first.
+    fn minted_millis(&self) -> u64 {
+        Self::kind_of(&self.0)
+            .and_then(|kind| self.0.strip_prefix(&kind.prefix()))
+            .and_then(|millis| millis.parse().ok())
+            .unwrap_or_default()
     }
 
     /// The run a report file belongs to, or `None` for any other file.
@@ -170,6 +263,24 @@ impl Display for RunId {
     }
 }
 
+/// The machine-wide run slot, held for as long as this lives.
+///
+/// Opaque on purpose: holding it is the whole contract, and the lock is
+/// released by dropping it or, if the process dies, by the kernel.
+pub struct RunSlot {
+    #[allow(dead_code)]
+    lock: Flock<File>,
+    /// Decremented on drop, so this server can tell its own blocking tool
+    /// from another process holding the file lock.
+    claims: Arc<AtomicUsize>,
+}
+
+impl Drop for RunSlot {
+    fn drop(&mut self) {
+        self.claims.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// How often a draining server checks whether its runs have finished.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -180,6 +291,8 @@ static LAST_RUN_MILLIS: AtomicU64 = AtomicU64::new(0);
 /// Tracks load-test runs started through this server.
 #[derive(Clone)]
 pub struct RunRegistry {
+    /// Blocking spend tools holding the slot in this process.
+    claims: Arc<AtomicUsize>,
     reports_dir: PathBuf,
     in_flight: Arc<Mutex<HashMap<RunId, JoinHandle<()>>>>,
 }
@@ -189,6 +302,7 @@ impl RunRegistry {
         Self {
             reports_dir,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            claims: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -208,7 +322,7 @@ impl RunRegistry {
     /// `make_flow` is a closure rather than a future for the same reason: the
     /// future must not exist until it is on the thread that will poll it. It
     /// receives the identifier so the flow can name its report after it.
-    pub fn start<M, F>(&self, make_flow: M) -> Result<RunId, StartRefused>
+    pub fn start<M, F>(&self, kind: RunKind, make_flow: M) -> Result<RunId, StartRefused>
     where
         M: FnOnce(RunId) -> F + Send + 'static,
         F: Future<Output = ()>,
@@ -226,7 +340,7 @@ impl RunRegistry {
         }
         let machine_lock = self.lock_machine_slot()?;
 
-        let run_id = RunId::mint();
+        let run_id = RunId::mint(kind);
         let flow_id = run_id.clone();
         let handle = tokio::task::spawn_blocking(move || {
             // Held for as long as the run lives on this thread.
@@ -247,12 +361,35 @@ impl RunRegistry {
         Ok(run_id)
     }
 
+    /// Hold the machine-wide run slot for a flow that blocks rather than
+    /// detaching.
+    ///
+    /// Detaching is about outliving a request, not about exclusion: a flow
+    /// short enough to answer inside one still spends from the same wallets,
+    /// so it takes the same slot. The guard releases it when dropped.
+    pub fn claim_slot(&self) -> Result<RunSlot, StartRefused> {
+        let lock = self.lock_machine_slot()?;
+        self.claims.fetch_add(1, Ordering::SeqCst);
+        Ok(RunSlot {
+            lock,
+            claims: Arc::clone(&self.claims),
+        })
+    }
+
     /// Take the machine-wide run slot, without waiting.
     ///
     /// An advisory `flock` on a file in the reports directory. The in-memory
     /// map above answers for this process; this answers for every other axe
     /// process sharing the data directory, which share the wallets too.
     fn lock_machine_slot(&self) -> Result<Flock<File>, StartRefused> {
+        // The file lock cannot tell this server's own blocking tool from
+        // another process, and both hit EWOULDBLOCK. Asking here first is
+        // what keeps the refusal from sending an operator to look for a
+        // second process that does not exist.
+        if self.claims.load(Ordering::SeqCst) > 0 {
+            return Err(StartRefused::SlotHeldHere);
+        }
+
         let lock = self.reports_dir.join(LOCK_FILE);
         let unavailable = |error: &dyn Display| StartRefused::LockUnavailable {
             lock: lock.clone(),
@@ -326,6 +463,26 @@ impl RunRegistry {
         }
     }
 
+    /// Write a run's report artifact.
+    ///
+    /// The load test writes its own, because it already had a report type and
+    /// a place to put it. The flows that did not — the intent runs — hand
+    /// theirs here, so every detached run is read back the same way and a
+    /// failed one still leaves a record of what it had spent.
+    pub fn record_report<T: Serialize>(&self, run_id: &RunId, report: &T) {
+        let path = self.reports_dir.join(format!("{run_id}.json"));
+        let written = serde_json::to_vec_pretty(report)
+            .map_err(std::io::Error::other)
+            .and_then(|body| std::fs::write(&path, body));
+
+        // Nothing is waiting on this: the caller already holds its identifier
+        // and the run has finished. A run whose report could not be written
+        // reads back as unknown, which is what it is.
+        if let Err(error) = written {
+            crate::mcp::activity::report_unwritable(run_id, &path, &error);
+        }
+    }
+
     async fn read_report(&self, run_id: &RunId) -> Option<serde_json::Value> {
         let path = self.reports_dir.join(format!("{run_id}.json"));
         let text = tokio::fs::read_to_string(path).await.ok()?;
@@ -360,8 +517,7 @@ impl RunRegistry {
             }
         }
 
-        ids.sort_unstable();
-        ids.reverse();
+        ids.sort_unstable_by_key(|id| (std::cmp::Reverse(id.minted_millis()), id.clone()));
 
         ids.into_iter()
             .map(|run_id| {
@@ -370,7 +526,11 @@ impl RunRegistry {
                 } else {
                     RunStatus::Finished
                 };
-                RunListEntry { run_id, state }
+                RunListEntry {
+                    kind: run_id.kind(),
+                    run_id,
+                    state,
+                }
             })
             .collect()
     }
@@ -384,7 +544,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{RunId, RunRegistry, RunState, RunStatus, StartRefused};
+    use super::{RunId, RunKind, RunRegistry, RunState, RunStatus, StartRefused};
 
     static DIRS: AtomicUsize = AtomicUsize::new(0);
 
@@ -415,7 +575,7 @@ mod tests {
 
     #[test]
     fn run_ids_are_unique_and_ascending_within_a_burst() {
-        let ids: Vec<RunId> = (0..50).map(|_| RunId::mint()).collect();
+        let ids: Vec<RunId> = (0..50).map(|_| RunId::mint(RunKind::LoadTest)).collect();
         for pair in ids.windows(2) {
             assert!(
                 pair[0] < pair[1],
@@ -495,7 +655,7 @@ mod tests {
         let (release, held) = tokio::sync::oneshot::channel::<()>();
 
         let first = registry
-            .start(move |_| async move {
+            .start(RunKind::LoadTest, move |_| async move {
                 let _ = held.await;
             })
             .unwrap();
@@ -504,7 +664,7 @@ mod tests {
             RunState::Running { .. }
         ));
         assert_eq!(
-            registry.start(|_| async {}),
+            registry.start(RunKind::LoadTest, |_| async {}),
             Err(StartRefused::RunInFlight {
                 run_id: first.clone()
             })
@@ -513,10 +673,45 @@ mod tests {
         drop(release);
         wait_until_finished(&registry, &first).await;
 
-        let second = registry.start(|_| async {}).unwrap();
+        let second = registry.start(RunKind::LoadTest, |_| async {}).unwrap();
         assert!(second > first, "identifiers keep ascending across runs");
         wait_until_finished(&registry, &second).await;
         assert!(registry.list().await.is_empty(), "no report, no listing");
+    }
+
+    /// A blocking spend takes the same slot as a detached one: both spend
+    /// from the same wallets, so neither may run while the other does.
+    #[tokio::test]
+    async fn a_claimed_slot_refuses_a_run_until_it_is_dropped() {
+        let registry = RunRegistry::new(scratch_reports_dir());
+
+        let slot = registry.claim_slot().expect("the slot starts free");
+        // Named as this server's own doing: the file lock cannot tell the
+        // difference, so the registry answers before reaching it.
+        assert_eq!(
+            registry.start(RunKind::LoadTest, |_| async {}),
+            Err(StartRefused::SlotHeldHere)
+        );
+
+        drop(slot);
+        let run_id = registry
+            .start(RunKind::LoadTest, |_| async {})
+            .expect("the slot is free again");
+        wait_until_finished(&registry, &run_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_run_records_its_own_report() {
+        let dir = scratch_reports_dir();
+        let registry = RunRegistry::new(dir);
+        let run_id = RunId::mint(RunKind::IntentsSend);
+
+        registry.record_report(&run_id, &json!({"outcome": "completed"}));
+
+        assert!(matches!(
+            registry.state(&run_id.to_string()).await,
+            RunState::Finished { report, .. } if report == json!({"outcome": "completed"})
+        ));
     }
 
     #[tokio::test]
@@ -525,12 +720,38 @@ mod tests {
         let (send_id, seen_id) = tokio::sync::oneshot::channel::<RunId>();
 
         let run_id = registry
-            .start(move |id| async move {
+            .start(RunKind::LoadTest, move |id| async move {
                 let _ = send_id.send(id);
             })
             .unwrap();
 
         assert_eq!(seen_id.await.unwrap(), run_id);
+    }
+
+    /// Identifiers sort as text by their kind first, so ordering by the text
+    /// would group the listing by flow and call it newest-first.
+    #[tokio::test]
+    async fn listing_orders_runs_of_different_kinds_by_when_they_were_minted() {
+        let dir = scratch_reports_dir();
+        write_report(&dir, "axe-load-test-1700000000003", &json!({}));
+        write_report(&dir, "axe-intents-traffic-1700000000005", &json!({}));
+        write_report(&dir, "axe-intents-sweep-1700000000004", &json!({}));
+        let registry = RunRegistry::new(dir);
+
+        let listed = registry.list().await;
+        let ids: Vec<String> = listed
+            .iter()
+            .map(|entry| entry.run_id.to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "axe-intents-traffic-1700000000005",
+                "axe-intents-sweep-1700000000004",
+                "axe-load-test-1700000000003",
+            ]
+        );
+        assert_eq!(listed[0].kind, Some(RunKind::IntentsTraffic));
     }
 
     #[tokio::test]
@@ -557,7 +778,7 @@ mod tests {
         let registry = RunRegistry::new(scratch_reports_dir());
         let (release, held) = tokio::sync::oneshot::channel::<()>();
         let run_id = registry
-            .start(move |_| async move {
+            .start(RunKind::LoadTest, move |_| async move {
                 let _ = held.await;
             })
             .unwrap();
@@ -579,12 +800,12 @@ mod tests {
         let (release, held) = tokio::sync::oneshot::channel::<()>();
 
         let run_id = first_server
-            .start(move |_| async move {
+            .start(RunKind::LoadTest, move |_| async move {
                 let _ = held.await;
             })
             .unwrap();
         assert_eq!(
-            second_server.start(|_| async {}),
+            second_server.start(RunKind::LoadTest, |_| async {}),
             Err(StartRefused::HeldByAnotherProcess {
                 lock: dir.join(super::LOCK_FILE)
             })
@@ -592,7 +813,9 @@ mod tests {
 
         drop(release);
         wait_until_finished(&first_server, &run_id).await;
-        let second = second_server.start(|_| async {}).unwrap();
+        let second = second_server
+            .start(RunKind::LoadTest, |_| async {})
+            .unwrap();
         wait_until_finished(&second_server, &second).await;
     }
 }

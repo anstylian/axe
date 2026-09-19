@@ -28,7 +28,7 @@ use self::route::{
     plan_send, plan_sweep, render_plans,
 };
 use self::stats::percentile;
-use self::types::{LegResult, RoutePlan, RunLimits};
+use self::types::{LegPlan, LegResult, RoutePlan, RunLimits};
 use crate::config::ChainsConfig;
 use crate::shutdown::{DrainTarget, Shutdown};
 use crate::types::Network;
@@ -37,10 +37,10 @@ use crate::ui;
 pub use self::types::{AssetSpec, AssetType, HumanAmount, OrderType};
 pub use benchmark::{
     QuoteBenchmarkArgs, QuoteBenchmarkLimit, QuoteBenchmarkMode, QuoteBenchmarkTarget,
-    benchmark_quotes,
+    benchmark_quotes, benchmark_quotes_data,
 };
-pub use inventory::{InventoryArgs, inventory};
-pub use read::{ApiArgs, CatalogArgs, StatusArgs, catalog, status};
+pub use inventory::{InventoryArgs, inventory, inventory_report};
+pub use read::{ApiArgs, CatalogArgs, StatusArgs, catalog, catalog_data, status, status_data};
 pub use stress::{StressArgs, run as stress};
 pub use traffic::{TrafficArgs, run as traffic};
 
@@ -160,6 +160,10 @@ pub struct SweepArgs {
     pub wallet_bps: u16,
     pub order_type: OrderType,
     pub asset_type: AssetType,
+    /// Stop before a pass that would take the run past this many intents.
+    /// `None` lets the sweep count alone bound the run, which is what the CLI
+    /// does. A caller spending against a budget sets it.
+    pub max_intents: Option<u64>,
 }
 
 struct IntentRuntime {
@@ -170,16 +174,33 @@ struct IntentRuntime {
     auto_confirm: bool,
 }
 
-pub async fn quote(args: QuoteArgs) -> Result<()> {
-    let startup = IntentActivity::new("Loading intent configuration…", !args.json);
+/// A quoted route, with everything the deposit that may follow needs.
+struct QuotedRoute {
+    runtime: IntentRuntime,
+    discovery: RouteDiscovery,
+    plan: LegPlan,
+    /// Who the quote was requested for, which is the wallet unless the caller
+    /// named someone else.
+    sender: Address,
+}
+
+/// Load the runtime, find the wallet's funded chains, and quote the route.
+///
+/// The first half of [`quote`], and all of [`plan_quote`]: asking for a quote
+/// spends nothing, so the two share everything up to the deposit.
+async fn quoted_route(args: QuoteArgs, show_progress: bool) -> Result<QuotedRoute> {
+    let startup = IntentActivity::new("Loading intent configuration…", show_progress);
     let runtime = prepare_runtime(args.runtime).await?;
-    let wallet = runtime.signer.address();
-    let sender = args.sender.unwrap_or(wallet);
+    let sender = args.sender.unwrap_or_else(|| runtime.signer.address());
     let recipient = args.recipient.unwrap_or(sender);
     startup.bar.set_message("Checking funded chains…");
-    let discovery_feedback = DiscoveryFeedback::Quiet;
-    let discovery =
-        discover_wallet(&runtime.client, &runtime.config, sender, discovery_feedback).await?;
+    let discovery = discover_wallet(
+        &runtime.client,
+        &runtime.config,
+        sender,
+        DiscoveryFeedback::Quiet,
+    )
+    .await?;
     startup.bar.set_message("Requesting intent quote…");
     let plan = plan_send(
         &runtime.client,
@@ -191,8 +212,36 @@ pub async fn quote(args: QuoteArgs) -> Result<()> {
     )
     .await?;
     drop(startup);
-    read::render_planned_quote(&plan, args.json)?;
-    if args.json {
+
+    Ok(QuotedRoute {
+        runtime,
+        discovery,
+        plan,
+        sender,
+    })
+}
+
+/// Quote a route and return it, without offering to deposit it.
+///
+/// The quote-only half of [`quote`]. Nothing here spends: it reads the
+/// wallet's balances and asks the RFQ API what it would pay.
+pub async fn plan_quote(args: QuoteArgs) -> Result<read::PlannedQuote> {
+    let quoted = quoted_route(args, false).await?;
+    Ok(read::PlannedQuote::from_plan(&quoted.plan))
+}
+
+pub async fn quote(args: QuoteArgs) -> Result<()> {
+    let json = args.json;
+    let QuotedRoute {
+        runtime,
+        discovery,
+        plan,
+        sender,
+    } = quoted_route(args, !json).await?;
+    let wallet = runtime.signer.address();
+
+    read::render_planned_quote(&plan, json)?;
+    if json {
         return Ok(());
     }
     if sender != wallet {
@@ -223,7 +272,7 @@ pub async fn quote(args: QuoteArgs) -> Result<()> {
     Ok(())
 }
 
-pub async fn send(args: SendArgs) -> Result<()> {
+pub async fn send(args: SendArgs) -> Result<LegResult> {
     let startup = IntentActivity::new("Loading intent configuration…", true);
     let runtime = prepare_runtime(args.runtime).await?;
     startup.bar.set_message("Checking funded chains…");
@@ -266,10 +315,10 @@ pub async fn send(args: SendArgs) -> Result<()> {
     drop(activity);
     let result = result?;
     render_summary(std::slice::from_ref(&result), 1);
-    Ok(())
+    Ok(result)
 }
 
-pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
+pub async fn roundtrip(args: RoundtripArgs) -> Result<Vec<LegResult>> {
     let startup = IntentActivity::new("Loading intent configuration…", true);
     let runtime = prepare_runtime(args.runtime).await?;
     startup.bar.set_message("Checking funded chains…");
@@ -309,10 +358,10 @@ pub async fn roundtrip(args: RoundtripArgs) -> Result<()> {
     .await;
     drop(activity);
     render_summary(&results, 2);
-    executed
+    executed.map(|()| results)
 }
 
-pub async fn sweep(args: SweepArgs) -> Result<()> {
+pub async fn sweep(args: SweepArgs) -> Result<Vec<LegResult>> {
     let runtime = prepare_runtime(args.runtime).await?;
     let _execution_lock = (!args.dry_run)
         .then(|| ExecutionLock::acquire(runtime.signer.address()))
@@ -353,9 +402,21 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
         }
         if args.dry_run {
             render_plans(&plans);
-            return Ok(());
+            return Ok(results);
         }
         let pass_intents = plans.len() * 2;
+
+        // A pass is all or nothing: its round trips are planned together and
+        // half a round trip leaves funds on the wrong chain. So a pass that
+        // would breach the cap is not started at all.
+        if would_exceed(args.max_intents, planned_intents, pass_intents) {
+            ui::info(&format!(
+                "stopping before sweep {sweep}: its {pass_intents} intents would pass the \
+                 cap of {} for this run",
+                args.max_intents.unwrap_or_default()
+            ));
+            break;
+        }
         planned_intents += pass_intents;
         ui::info(&format!(
             "sweep {sweep}: {} {} round trips, {pass_intents} intents",
@@ -369,7 +430,7 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
             Ok(true) => {}
             Ok(false) => {
                 render_summary(&results, planned_intents);
-                return Ok(());
+                return Ok(results);
             }
             Err(error) => {
                 render_summary(&results, planned_intents);
@@ -386,7 +447,12 @@ pub async fn sweep(args: SweepArgs) -> Result<()> {
     }
 
     render_summary(&results, planned_intents);
-    Ok(())
+    Ok(results)
+}
+
+/// Whether one more pass would take a capped run past its cap.
+fn would_exceed(max_intents: Option<u64>, so_far: usize, next: usize) -> bool {
+    max_intents.is_some_and(|max| so_far.saturating_add(next) as u64 > max)
 }
 
 async fn execute_sweep_pass(

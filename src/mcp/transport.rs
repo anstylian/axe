@@ -31,6 +31,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
+use crate::mcp::activity;
 use crate::mcp::server::AxeMcp;
 
 /// The environment variable carrying the HTTP bearer token.
@@ -163,7 +164,17 @@ pub async fn serve_http_on(listener: TcpListener, server: AxeMcp, token: String)
             .acquire_owned()
             .await
             .wrap_err("connection limiter closed")?;
-        let (stream, _peer) = listener.accept().await.wrap_err("accept failed")?;
+        // A failed accept is that client's problem, not the server's:
+        // ECONNABORTED (a client that reset between SYN and accept) and
+        // EMFILE are routine and transient, and taking the listener down for
+        // one would end the session and abandon any run in flight.
+        let stream = match listener.accept().await {
+            Ok((stream, _peer)) => stream,
+            Err(e) => {
+                activity::accept_failed(&e);
+                continue;
+            }
+        };
         let service = service.clone();
         tokio::spawn(async move {
             let _ = http1::Builder::new()

@@ -23,6 +23,7 @@ pub mod context;
 pub mod guidance;
 pub mod outcome;
 pub mod policy;
+pub mod results;
 pub mod runs;
 pub mod server;
 pub mod transport;
@@ -33,7 +34,7 @@ pub mod transport;
 /// process lifetime.
 pub async fn serve(
     network: Network,
-    allow_mainnet: bool,
+    deny_mainnet: bool,
     limits: SpendLimits,
     endpoint: Endpoint,
 ) -> Result<()> {
@@ -47,7 +48,7 @@ pub async fn serve(
     // run registry treats every report file in there as a run.
     let ledger = data_root().join("spend-ledger.json");
     let policy = SpendPolicy::persistent(limits, ledger.clone())?;
-    let context = McpContext::new(network, allow_mainnet, reports_dir.clone(), policy)?;
+    let context = McpContext::new(network, deny_mainnet, reports_dir.clone(), policy)?;
 
     activity::startup(&activity::Startup {
         network,
@@ -59,10 +60,14 @@ pub async fn serve(
         reports_dir,
         ledger,
     });
-    transport::serve(AxeMcp::new(context.clone()), endpoint).await?;
+    // Not `?`: a transport that fails is exactly the case the drain below
+    // exists for, and returning here would take an in-flight run -- one that
+    // has already spent funds -- down with the process before it can write
+    // its report.
+    let served = transport::serve(AxeMcp::new(context.clone()), endpoint).await;
 
     finish_in_flight_runs(context.runs()).await;
-    Ok(())
+    served
 }
 
 /// Stay alive until running load tests finish.

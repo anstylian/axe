@@ -24,16 +24,18 @@ pub struct McpContext {
 }
 
 impl McpContext {
-    /// Refuse mainnet unless the operator opted in when starting the server.
+    /// Serve the network the operator pinned, mainnet included, unless they
+    /// shut mainnet out when starting the server.
     pub fn new(
         network: Network,
-        allow_mainnet: bool,
+        deny_mainnet: bool,
         reports_dir: PathBuf,
         policy: SpendPolicy,
     ) -> Result<Self> {
-        if network == Network::Mainnet && !allow_mainnet {
+        if network == Network::Mainnet && deny_mainnet {
             return Err(eyre::eyre!(
-                "refusing to serve mainnet without --allow-mainnet: these flows spend real funds"
+                "refusing to serve mainnet: --deny-mainnet was passed, and these flows spend \
+                 real funds"
             ));
         }
 
@@ -69,23 +71,23 @@ mod tests {
     use crate::types::Network;
 
     #[test]
-    fn mainnet_is_refused_without_the_opt_in() {
+    fn mainnet_is_refused_when_it_was_denied() {
         let err = McpContext::new(
             Network::Mainnet,
-            false,
+            true,
             PathBuf::from("."),
             SpendPolicy::default(),
         )
         .err()
-        .expect("mainnet without --allow-mainnet must be refused");
-        assert!(err.to_string().contains("--allow-mainnet"), "{err}");
+        .expect("mainnet with --deny-mainnet must be refused");
+        assert!(err.to_string().contains("--deny-mainnet"), "{err}");
     }
 
     #[test]
-    fn mainnet_is_served_with_the_opt_in() {
+    fn mainnet_is_served_by_default() {
         let context = McpContext::new(
             Network::Mainnet,
-            true,
+            false,
             PathBuf::from("."),
             SpendPolicy::default(),
         )
@@ -93,11 +95,12 @@ mod tests {
         assert_eq!(context.network(), Network::Mainnet);
     }
 
+    /// The flag names mainnet, so it says nothing about anything else.
     #[test]
-    fn other_networks_need_no_opt_in() {
+    fn denying_mainnet_leaves_the_other_networks_alone() {
         let context = McpContext::new(
             Network::Testnet,
-            false,
+            true,
             PathBuf::from("."),
             SpendPolicy::default(),
         )

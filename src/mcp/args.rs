@@ -6,12 +6,16 @@
 //! else comes from the operator environment the server was launched with.
 //! A test in the server module fails if a key-bearing field is ever added.
 
+use std::time::Duration;
+
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::cli::{EvmContract, SolProgram};
 use crate::commands::load_test::{Protocol, TestType};
-use crate::commands::test_express;
+use crate::commands::{express_originate, test_express};
+
+pub mod intents;
 
 /// How many recent entries to report when the caller does not say.
 pub const DEFAULT_ACTIVITY_LIMIT: usize = 20;
@@ -105,6 +109,76 @@ impl ExpressScanArgs {
     }
 }
 
+/// How long a watch waits before reporting where a transfer had got to, when
+/// the caller does not say.
+pub const DEFAULT_WAIT_SECS: u64 = 60;
+
+/// The longest a watch will hold a request open, whatever the caller asks for.
+///
+/// Reimbursement can take half an hour, which is why the CLI waits that long.
+/// A tool call holding a request open that long would be cancelled by the
+/// client instead, so this waits far less and reports the phase reached. The
+/// caller asks again; nothing is lost, because watching spends nothing.
+pub const MAX_WAIT_SECS: u64 = 300;
+
+/// Arguments for watching one express transfer.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExpressWatchArgs {
+    /// Source transaction hash to watch through both express phases.
+    pub source_tx: String,
+    /// Seconds to wait for a terminal phase before reporting where it got to.
+    /// Defaults to 60, and is capped at 300.
+    #[schemars(range(min = 1, max = 300))]
+    pub wait_secs: Option<u64>,
+}
+
+impl ExpressWatchArgs {
+    pub fn wait(&self) -> Duration {
+        Duration::from_secs(
+            self.wait_secs
+                .unwrap_or(DEFAULT_WAIT_SECS)
+                .min(MAX_WAIT_SECS),
+        )
+    }
+}
+
+/// Arguments for originating an express transfer.
+///
+/// The asset, the AxelarApp proxy and the signing key are not here: the first
+/// two are fixed by the express registry, and the key comes from the operator
+/// environment.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExpressOriginateArgs {
+    /// Source chain axelar id. Must be an EVM chain carrying the AxelarApp
+    /// proxy, for example avalanche-fuji.
+    pub source_chain: String,
+    /// Destination chain axelar id.
+    pub destination_chain: String,
+    /// Express-asset base units at six decimals. Defaults to 5000000, and
+    /// must stay inside the express registry's per-chain cap.
+    pub amount: Option<String>,
+    /// Seconds to watch the transfer for after sending it. Defaults to 60,
+    /// and is capped at 300; the transfer is reported either way.
+    #[schemars(range(min = 1, max = 300))]
+    pub wait_secs: Option<u64>,
+}
+
+impl ExpressOriginateArgs {
+    pub fn amount(&self) -> String {
+        self.amount
+            .clone()
+            .unwrap_or_else(|| express_originate::DEFAULT_AMOUNT.to_string())
+    }
+
+    pub fn wait(&self) -> Duration {
+        Duration::from_secs(
+            self.wait_secs
+                .unwrap_or(DEFAULT_WAIT_SECS)
+                .min(MAX_WAIT_SECS),
+        )
+    }
+}
+
 /// Arguments for starting a load test.
 ///
 /// Carries no keys, no RPC overrides and no config path: those come from the
@@ -134,7 +208,8 @@ impl StartLoadTestArgs {
 /// Arguments for a tool that names one background run.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunArgs {
-    /// The run identifier returned by start_load_test.
+    /// The run identifier returned by start_load_test, intents_sweep,
+    /// intents_traffic or intents_stress.
     pub run_id: String,
 }
 

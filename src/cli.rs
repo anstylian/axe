@@ -142,11 +142,12 @@ pub enum Commands {
     Mcp {
         #[command(subcommand)]
         action: Option<McpCommands>,
-        /// Allow the server to be pinned to mainnet. Without this, starting
-        /// against mainnet is refused: the flows spend real funds, so that
-        /// decision is made once by a human outside the conversation.
+        /// Refuse to serve mainnet. Every network is served without it,
+        /// mainnet included; pass this to shut out the one where a flow
+        /// spends real funds. The decision is made once by a human outside
+        /// the conversation, since no tool argument can change the network.
         #[arg(long)]
-        allow_mainnet: bool,
+        deny_mainnet: bool,
         /// The most transactions one load test started through the server
         /// may send. Enforced by the server, so no tool argument can raise it.
         #[arg(long, default_value_t = crate::mcp::policy::DEFAULT_MAX_TXS_PER_RUN)]
@@ -761,11 +762,11 @@ pub enum TestCommands {
 
         /// Express-asset base units (6 decimals) to send with --originate.
         /// Must stay inside the express registry's per-chain cap.
-        #[arg(long, default_value = "5000000")]
+        #[arg(long, default_value = crate::commands::express_originate::DEFAULT_AMOUNT)]
         amount: String,
 
         /// Native gas to attach to the --originate call, in wei.
-        #[arg(long, default_value = "350000000000000000")]
+        #[arg(long, default_value = crate::commands::express_originate::DEFAULT_GAS_VALUE_WEI)]
         gas_value: String,
 
         /// Override the AxelarApp proxy address used by --originate.

@@ -39,10 +39,7 @@ pub fn startup(startup: &Startup) {
     ));
     line(&format!("endpoint: {}", startup.endpoint));
     line(&startup.caps);
-    line(&format!(
-        "load-test reports: {}",
-        startup.reports_dir.display()
-    ));
+    line(&format!("run reports: {}", startup.reports_dir.display()));
     line(&format!("spend ledger: {}", startup.ledger.display()));
 
     let tools = AxeMcp::catalogue();
@@ -100,6 +97,21 @@ pub fn draining(run_ids: &[RunId]) {
 /// Every run finished; the process can exit.
 pub fn drained() {
     line("all runs finished; exiting");
+}
+
+/// A finished run could not leave its report behind. The operator is the only
+/// one who can act on this: the caller will simply see the run as unknown.
+pub fn report_unwritable(run_id: &RunId, path: &std::path::Path, error: &std::io::Error) {
+    line(&format!(
+        "run {run_id} finished but its report could not be written to {}: {error}",
+        path.display()
+    ));
+}
+
+/// One connection could not be accepted. The listener carries on, so this is
+/// a note rather than a failure.
+pub fn accept_failed(error: &std::io::Error) {
+    line(&format!("could not accept a connection: {error}"));
 }
 
 fn tool_call_line(

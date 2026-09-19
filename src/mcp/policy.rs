@@ -150,6 +150,14 @@ impl SpendPolicy {
         })
     }
 
+    /// Whether the operator named the chains a spend may use.
+    ///
+    /// A flow that picks its own route cannot be checked against the list, so
+    /// it asks this and refuses itself rather than spending outside it.
+    pub fn restricts_chains(&self) -> bool {
+        !self.limits.allowed_chains.is_empty()
+    }
+
     /// Refuse a chain the operator did not allow.
     pub fn check_chain(&self, chain: &str) -> Result<(), PolicyViolation> {
         let allowed = &self.limits.allowed_chains;
@@ -328,6 +336,19 @@ mod tests {
         policy.release(3);
         assert_eq!(policy.reserve(3), Ok(()));
         assert!(policy.reserve(1).is_err(), "budget is spent");
+    }
+
+    /// A run bounded at ten that sends two has not spent ten. Without the
+    /// refund a lifetime budget counts down by what was reserved, so runs
+    /// that find few routes exhaust it while spending almost nothing.
+    #[test]
+    fn the_unspent_part_of_a_reservation_goes_back_to_the_budget() {
+        let policy = policy(10, Some(12), &[]);
+        assert_eq!(policy.reserve(10), Ok(()));
+        policy.release(10 - 2);
+
+        assert_eq!(policy.reserve(10), Ok(()), "only 2 of the 12 were spent");
+        assert!(policy.reserve(1).is_err(), "and now the budget is gone");
     }
 
     #[test]
