@@ -85,6 +85,9 @@ pub struct IntentRuntimeArgs {
     pub poll_interval_secs: u64,
     pub fulfillment_timeout_secs: u64,
     pub yes: bool,
+    /// Chains a route may use, by axelar id. Empty means any, which is what
+    /// the CLI passes: the person running it is the one choosing the routes.
+    pub allowed_chains: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -503,7 +506,12 @@ async fn prepare_runtime(args: IntentRuntimeArgs) -> Result<IntentRuntime> {
         .private_key
         .parse()
         .wrap_err("intent EVM private key is not valid hex")?;
-    let config = ChainsConfig::load(&args.config).await?;
+    let mut config = ChainsConfig::load(&args.config).await?;
+    // Every flow discovers its routes by resolving the RFQ catalog against
+    // this map, so narrowing it here is what keeps a restricted run inside
+    // the chains it was allowed -- including the flows that pick their own
+    // routes, which have no route to check up front.
+    config.retain_chains(&args.allowed_chains);
     let client = RfqClient::new(args.network, args.rfq_url.as_deref())?;
     let limits = RunLimits {
         poll_interval: Duration::from_secs(args.poll_interval_secs),

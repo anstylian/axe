@@ -685,5 +685,8 @@ async fn resolve_intent_runtime_config(
         poll_interval_secs: options.poll_interval_secs,
         fulfillment_timeout_secs: options.fulfillment_timeout_secs,
         yes,
+        // The CLI restricts nothing: whoever typed the command chose the
+        // route, and the chain allowlist is an `axe mcp` cap.
+        allowed_chains: Vec::new(),
     })
 }

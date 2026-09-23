@@ -1152,8 +1152,13 @@ impl AxeMcp {
             .into_path())
     }
 
-    /// Everything an intent flow needs beyond its route: the network's config
-    /// and the operator's signing key.
+    /// Everything an intent flow needs beyond its route: the network's config,
+    /// the operator's signing key, and the chains they allowed.
+    ///
+    /// The allowlist travels with the runtime rather than being checked here
+    /// because these flows discover their own routes. Narrowing the chains
+    /// config is what keeps them inside it; a route on a chain the operator
+    /// did not allow is never discovered, so there is nothing to refuse.
     ///
     /// `yes` is set because there is no terminal to confirm at. The client's
     /// own approval prompt is the gate, as it is for every other spend tool.
@@ -1177,6 +1182,7 @@ impl AxeMcp {
             poll_interval_secs: INTENT_POLL_INTERVAL_SECS,
             fulfillment_timeout_secs: INTENT_FULFILLMENT_TIMEOUT_SECS,
             yes: true,
+            allowed_chains: self.context.policy().allowed_chains().to_vec(),
         })
     }
 
@@ -1206,20 +1212,6 @@ impl AxeMcp {
         let network = self.context.network();
         let policy = self.context.policy();
 
-        // The intent flows choose their own routes from the RFQ catalog,
-        // whose chains are CAIP-2 ids rather than the axelar ids the
-        // allowlist is written in. Rather than guess at a mapping and let a
-        // spend through on a wrong match, an operator who restricted the
-        // chains does not get these tools.
-        if policy.restricts_chains() {
-            return Err(ErrorData::invalid_request(
-                "the operator restricted which chains may be used, and the intent flows pick \
-                 their routes from the RFQ catalog rather than from that list. Use \
-                 start_load_test for a run on a named route."
-                    .to_string(),
-                None,
-            ));
-        }
         policy
             .reserve(bounds.max_intents)
             .map_err(|violation| ErrorData::invalid_params(violation.to_string(), None))?;
@@ -1678,27 +1670,6 @@ mod tests {
             .expect_err("11 intents exceed the default cap of 10");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
         assert!(err.message.contains("per-run cap of 10"), "{}", err.message);
-    }
-
-    /// The intent flows pick their own routes from the RFQ catalog, whose
-    /// chains are named differently from the allowlist's. Refusing is the
-    /// honest answer; spending on an unchecked chain is not.
-    #[tokio::test]
-    async fn intent_runs_are_refused_entirely_when_the_operator_restricted_chains() {
-        let server = server_with(SpendPolicy::new(SpendLimits {
-            allowed_chains: vec!["solana".into()],
-            ..SpendLimits::default()
-        }));
-        let err = server
-            .intents_traffic(Parameters(intents_args::TrafficArgs {
-                max_intents: 1,
-                duration_secs: 60,
-                asset_type: None,
-                wallet_bps: None,
-            }))
-            .await
-            .expect_err("an allowlist the flow cannot be checked against must refuse it");
-        assert!(err.message.contains("restricted"), "{}", err.message);
     }
 
     #[test]

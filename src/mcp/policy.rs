@@ -150,12 +150,15 @@ impl SpendPolicy {
         })
     }
 
-    /// Whether the operator named the chains a spend may use.
+    /// The chains a spend may use, by axelar id. Empty means any.
     ///
-    /// A flow that picks its own route cannot be checked against the list, so
-    /// it asks this and refuses itself rather than spending outside it.
-    pub fn restricts_chains(&self) -> bool {
-        !self.limits.allowed_chains.is_empty()
+    /// A tool that names its chains checks them with [`check_chain`]. A flow
+    /// that discovers its own routes takes this list instead and narrows what
+    /// it can discover, which comes to the same thing a step earlier.
+    ///
+    /// [`check_chain`]: Self::check_chain
+    pub fn allowed_chains(&self) -> &[String] {
+        &self.limits.allowed_chains
     }
 
     /// Refuse a chain the operator did not allow.

@@ -60,10 +60,13 @@ from an agent rather than a person driving them:
   that pick their own routes, and reserved against the operator's budget
   before anything is quoted. `intents_traffic` additionally requires a
   duration, because nothing else would stop it.
-- **A chain allowlist refuses them.** The operator's `--allow-chain` list is
-  written in axelar ids; these flows choose routes from the RFQ catalog, which
-  names chains in CAIP-2. Rather than guess at a mapping, an operator who
-  restricted the chains does not get the intent spend tools.
+- **A chain allowlist narrows what they can find.** The operator's
+  `--allow-chain` list is applied to the chains config the run loads, and
+  every flow discovers its routes by resolving the RFQ catalog against that
+  config. A chain outside the list therefore resolves to nothing, is never
+  discovered, and never appears in a route — so the flows still run, on the
+  chains that were allowed. An allowlist that matches nothing the solver
+  serves comes back as "no funded routes", which is the honest answer.
 
 The read-only tools — `intents_catalog`, `intents_inventory`, `intents_quote`,
 `intents_status`, `intents_bench_quote` — answer in the call, and spend
