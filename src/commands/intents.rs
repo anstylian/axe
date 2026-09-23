@@ -175,6 +175,9 @@ struct IntentRuntime {
     client: RfqClient,
     limits: RunLimits,
     auto_confirm: bool,
+    /// Kept after narrowing the config, only so a route the caller named
+    /// itself can be refused by name rather than by absence.
+    allowed_chains: Vec<String>,
 }
 
 /// A quoted route, with everything the deposit that may follow needs.
@@ -194,6 +197,7 @@ struct QuotedRoute {
 async fn quoted_route(args: QuoteArgs, show_progress: bool) -> Result<QuotedRoute> {
     let startup = IntentActivity::new("Loading intent configuration…", show_progress);
     let runtime = prepare_runtime(args.runtime).await?;
+    runtime.check_named_route(&args.route)?;
     let sender = args.sender.unwrap_or_else(|| runtime.signer.address());
     let recipient = args.recipient.unwrap_or(sender);
     startup.bar.set_message("Checking funded chains…");
@@ -278,6 +282,7 @@ pub async fn quote(args: QuoteArgs) -> Result<()> {
 pub async fn send(args: SendArgs) -> Result<LegResult> {
     let startup = IntentActivity::new("Loading intent configuration…", true);
     let runtime = prepare_runtime(args.runtime).await?;
+    runtime.check_named_route(&args.route)?;
     startup.bar.set_message("Checking funded chains…");
     let discovery = discover_wallet(
         &runtime.client,
@@ -324,6 +329,7 @@ pub async fn send(args: SendArgs) -> Result<LegResult> {
 pub async fn roundtrip(args: RoundtripArgs) -> Result<Vec<LegResult>> {
     let startup = IntentActivity::new("Loading intent configuration…", true);
     let runtime = prepare_runtime(args.runtime).await?;
+    runtime.check_named_route(&args.route)?;
     startup.bar.set_message("Checking funded chains…");
     let discovery = discover_wallet(
         &runtime.client,
@@ -523,7 +529,51 @@ async fn prepare_runtime(args: IntentRuntimeArgs) -> Result<IntentRuntime> {
         client,
         limits,
         auto_confirm: args.yes,
+        allowed_chains: args.allowed_chains,
     })
+}
+
+impl IntentRuntime {
+    /// Refuse a route the caller named that leaves the allowed chains.
+    ///
+    /// The flows that pick their own routes never need this: the narrowed
+    /// config means a disallowed chain is not there to be discovered. A
+    /// caller that named its assets would otherwise be told the asset is not
+    /// in the catalog, which is true but hides the reason.
+    fn check_named_route(&self, route: &RouteChoice) -> Result<()> {
+        let RouteChoice::Explicit { from, to, .. } = route else {
+            return Ok(());
+        };
+        if self.allowed_chains.is_empty() {
+            return Ok(());
+        }
+
+        for asset in [from, to] {
+            let chain = &asset.id().chain_id;
+            if self.knows_evm_chain(chain) == Some(false) {
+                return Err(eyre!(
+                    "chain {chain} is not one of the chains this server may use: {}",
+                    self.allowed_chains.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the chains config carries this CAIP-2 chain, or `None` when
+    /// the id is not one this config could describe. Intent routes are EVM
+    /// only, so anything without an `eip155:` reference is left to the
+    /// catalog lookup to reject on its own terms.
+    fn knows_evm_chain(&self, caip2: &str) -> Option<bool> {
+        let reference = caip2.strip_prefix("eip155:")?;
+        let chain_id = reference.parse::<u64>().ok()?;
+        Some(
+            self.config
+                .chains
+                .values()
+                .any(|chain| chain.evm_chain_id == Some(chain_id)),
+        )
+    }
 }
 
 async fn confirm_execution(auto_confirm: bool, prompt: &str) -> Result<()> {

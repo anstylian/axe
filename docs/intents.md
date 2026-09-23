@@ -65,8 +65,9 @@ from an agent rather than a person driving them:
   every flow discovers its routes by resolving the RFQ catalog against that
   config. A chain outside the list therefore resolves to nothing, is never
   discovered, and never appears in a route — so the flows still run, on the
-  chains that were allowed. An allowlist that matches nothing the solver
-  serves comes back as "no funded routes", which is the honest answer.
+  chains that were allowed. A route you name yourself is refused by name
+  instead. An allowlist that matches nothing the solver serves comes back as
+  "no funded routes", which is the honest answer.
 
 The read-only tools — `intents_catalog`, `intents_inventory`, `intents_quote`,
 `intents_status`, `intents_bench_quote` — answer in the call, and spend
